@@ -1,0 +1,26 @@
+{
+  "mimesis_hurt": {
+    "sounds": [
+      {
+        "name": "mimesis:mimesis_hurt",
+        "stream": true
+      }
+    ]
+  },
+  "mimesis_scream": {
+    "sounds": [
+      {
+        "name": "mimesis:mimesis_scream",
+        "stream": true
+      }
+    ]
+  },
+  "mimesis_singing": {
+    "sounds": [
+      {
+        "name": "mimesis:mimesis_singing",
+        "stream": true
+      }
+    ]
+  }
+}

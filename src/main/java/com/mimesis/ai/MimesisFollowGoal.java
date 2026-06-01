@@ -1,0 +1,225 @@
+package com.mimesis.ai;
+
+import net.minecraft.world.entity.ai.goal.Goal;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.phys.Vec3;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
+
+import com.mimesis.entity.MimesisEntity;
+
+public class MimesisFollowGoal extends Goal {
+    private final MimesisEntity mimesis;
+    private final double followDistance;
+    private final double explorationRange;
+    private int randomWalkTimer = 0;
+    private Vec3 randomTarget = null;
+    private BlockPos randomTargetBlock = null;
+    private int sprintTimer = 0;
+    private int sprintDuration = 0;
+
+    public MimesisFollowGoal(MimesisEntity mimesis) {
+        this.mimesis = mimesis;
+        this.followDistance = 64.0D;
+        this.explorationRange = 50.0D;
+    }
+
+    @Override
+    public boolean canUse() {
+        Player target = this.getTargetPlayer();
+        return target != null;
+    }
+
+    @Override
+    public void tick() {
+        Player target = this.getTargetPlayer();
+        if (target == null) {
+            return;
+        }
+
+        double distance = this.mimesis.distanceTo(target);
+
+        // If too far, move closer faster
+        if (distance > this.explorationRange) {
+            this.moveToward(target.getX(), target.getZ(), 1.1D);
+            this.mimesis.setSprinting(true);
+            // Jump while sprinting to traverse obstacles
+            if (this.mimesis.onGround() && this.mimesis.getRandom().nextInt(5) == 0) {
+                this.makeJump();
+            }
+        } 
+        // If moderately far, walk normally but explore
+        else if (distance > 25.0D) {
+            // Explore around player area
+            this.exploreAroundPlayer(target);
+            this.randomizeSpeed(0.9D, 1.0D);
+            this.mimesis.setSprinting(false);
+        }
+        // If close enough, explore and interact
+        else {
+            // Look for nearby ores to break
+            BlockPos nearbyOre = this.findNearestOre();
+            if (nearbyOre != null) {
+                double oreDist = this.mimesis.blockPosition().distSqr(nearbyOre);
+                if (oreDist > 36) { // 6 blocks away
+                    this.moveToward(nearbyOre.getX() + 0.5D, nearbyOre.getZ() + 0.5D, 1.0D);
+                    // Very rarely sprint toward ores (reduced from 1/3 to 1/10)
+                    if (this.mimesis.getRandom().nextInt(10) == 0) {
+                        this.mimesis.setSprinting(true);
+                        if (this.mimesis.onGround()) {
+                            this.makeJump();
+                        }
+                    }
+                }
+            } else {
+                // Explore around player
+                this.exploreAroundPlayer(target);
+                this.randomizeSpeed(0.85D, 0.95D);
+                this.mimesis.setSprinting(false);
+            }
+
+            // Much less frequent sprinting (was too often)
+            this.sprintTimer--;
+            if (this.sprintTimer <= 0) {
+                this.sprintDuration = 15 + this.mimesis.getRandom().nextInt(25); // Shorter sprints
+                this.sprintTimer = 100 + this.mimesis.getRandom().nextInt(150); // Longer wait between sprints
+                if (this.mimesis.getRandom().nextInt(8) == 0) { // 1 in 8 chance instead of 1 in 3
+                    this.mimesis.setSprinting(true);
+                }
+            } else if (this.sprintDuration > 0) {
+                this.sprintDuration--;
+                this.mimesis.setSprinting(true);
+                // Jump while sprinting
+                if (this.mimesis.onGround() && this.mimesis.getRandom().nextInt(4) == 0) {
+                    this.makeJump();
+                }
+            } else {
+                this.mimesis.setSprinting(false);
+            }
+        }
+
+        // Occasionally look around
+        if (this.mimesis.getRandom().nextInt(15) < 2) {
+            this.mimesis.getLookControl().setLookAt(
+                target.getX() + (this.mimesis.getRandom().nextDouble() - 0.5) * 10,
+                target.getEyeY(),
+                target.getZ() + (this.mimesis.getRandom().nextDouble() - 0.5) * 10);
+        }
+    }
+
+    private void makeJump() {
+        // Make the entity jump by modifying velocity
+        this.mimesis.setDeltaMovement(
+            this.mimesis.getDeltaMovement().x,
+            0.42D, // Minecraft jump height
+            this.mimesis.getDeltaMovement().z
+        );
+    }
+
+    private void exploreAroundPlayer(Player target) {
+        this.randomWalkTimer--;
+        if (this.randomWalkTimer <= 0) {
+            // Create exploration targets in much narrower radius - less wandering
+            double angle = this.mimesis.getRandom().nextDouble() * Math.PI * 2;
+            double range = 5.0D + this.mimesis.getRandom().nextDouble() * 8.0D; // Reduced from 20-50 to 5-13
+            double targetX = target.getX() + Math.cos(angle) * range;
+            double targetZ = target.getZ() + Math.sin(angle) * range;
+            int groundY = this.mimesis.level().getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
+                    BlockPos.containing(targetX, target.getY(), targetZ).getX(),
+                    BlockPos.containing(targetX, target.getY(), targetZ).getZ());
+            this.randomTarget = new Vec3(
+                targetX,
+                groundY,
+                targetZ
+            );
+            this.randomTargetBlock = BlockPos.containing(this.randomTarget);
+            this.randomWalkTimer = 120 + this.mimesis.getRandom().nextInt(180); // Longer stays in one place
+        }
+
+        if (this.randomTarget != null && this.randomTargetBlock != null) {
+            if (!this.mimesis.getNavigation().isDone()) {
+                return;
+            }
+
+            this.mimesis.getNavigation().moveTo(
+                this.randomTarget.x,
+                this.randomTarget.y,
+                this.randomTarget.z,
+                0.8D
+            );
+        }
+    }
+
+    private void moveToward(double x, double z, double speed) {
+        int groundY = this.mimesis.level().getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
+                BlockPos.containing(x, this.mimesis.getY(), z).getX(),
+                BlockPos.containing(x, this.mimesis.getY(), z).getZ());
+        this.mimesis.getNavigation().moveTo(x, groundY, z, speed);
+    }
+
+    private void randomizeSpeed(double min, double max) {
+        double baseSpeed = min + (max - min) * this.mimesis.getRandom().nextDouble();
+        // Don't reset path constantly, just adjust
+    }
+
+    private BlockPos findNearestOre() {
+        BlockPos pos = this.mimesis.blockPosition();
+        BlockPos nearest = null;
+        double nearestDist = 144; // 12 blocks
+
+        for (int x = -12; x <= 12; x++) {
+            for (int y = -3; y <= 3; y++) {
+                for (int z = -12; z <= 12; z++) {
+                    BlockPos checkPos = pos.offset(x, y, z);
+                    Block block = this.mimesis.level().getBlockState(checkPos).getBlock();
+                    
+                    if (this.isValuableOre(block)) {
+                        double dist = pos.distSqr(checkPos);
+                        if (dist < nearestDist) {
+                            nearestDist = dist;
+                            nearest = checkPos;
+                        }
+                    }
+                }
+            }
+        }
+        return nearest;
+    }
+
+    private boolean isValuableOre(Block block) {
+        return block == Blocks.COAL_ORE || 
+               block == Blocks.DEEPSLATE_COAL_ORE ||
+               block == Blocks.IRON_ORE ||
+               block == Blocks.DEEPSLATE_IRON_ORE ||
+               block == Blocks.COPPER_ORE ||
+               block == Blocks.DEEPSLATE_COPPER_ORE ||
+               block == Blocks.GOLD_ORE ||
+               block == Blocks.DEEPSLATE_GOLD_ORE ||
+               block == Blocks.DIAMOND_ORE ||
+               block == Blocks.DEEPSLATE_DIAMOND_ORE ||
+               block == Blocks.EMERALD_ORE ||
+               block == Blocks.DEEPSLATE_EMERALD_ORE ||
+               block == Blocks.LAPIS_ORE ||
+               block == Blocks.DEEPSLATE_LAPIS_ORE;
+    }
+
+    @Override
+    public void stop() {
+        this.mimesis.getNavigation().stop();
+        this.mimesis.setSprinting(false);
+        this.randomWalkTimer = 0;
+        this.randomTarget = null;
+        this.randomTargetBlock = null;
+    }
+
+    private Player getTargetPlayer() {
+        return this.mimesis.level().getNearestPlayer(
+                this.mimesis.getX(),
+                this.mimesis.getY(),
+                this.mimesis.getZ(),
+                this.followDistance,
+                false);
+    }
+}

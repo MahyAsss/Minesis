@@ -1,0 +1,93 @@
+plugins {
+    id 'eclipse'
+    id 'maven-publish'
+    id 'net.minecraftforge.gradle' version '5.1.+'
+}
+
+group = 'com.mimesis'
+version = '1.0.5'
+archivesBaseName = 'mimesis'
+
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(17)
+}
+
+minecraft {
+    mappings channel: 'official', version: '1.20.1'
+    
+    runs {
+        client {
+            workingDirectory project.file('run')
+            property 'forge.logging.markers', 'SCAN,REGISTRIES,REGISTRYDUMP'
+            property 'forge.logging.level.net.minecraftforge', 'debug'
+            args '--username', 'Developer'
+            mods {
+                mimesis {
+                    source sourceSets.main
+                }
+            }
+        }
+        server {
+            workingDirectory project.file('run')
+            property 'forge.logging.markers', 'SCAN,REGISTRIES,REGISTRYDUMP'
+            property 'forge.logging.level.net.minecraftforge', 'debug'
+            args '--nogui'
+            mods {
+                mimesis {
+                    source sourceSets.main
+                }
+            }
+        }
+    }
+}
+
+repositories {
+    maven {
+        url 'https://maven.maxhenkel.de/releases'
+    }
+}
+
+// Baritone is provided at runtime via JitPack — used optionally through reflection
+repositories {
+    maven {
+        url 'https://jitpack.io'
+    }
+}
+
+dependencies {
+    minecraft 'net.minecraftforge:forge:1.20.1-47.2.0'
+
+    // Simple Voice Chat API (compile-time only, runtime provided by the mod)
+    compileOnly 'de.maxhenkel.voicechat:voicechat-api:2.6.13'
+
+    // Baritone API (compile-time only). The Baritone mod must be installed on the client
+    // similar to Simple Voice Chat; we don't bundle the runtime JAR into our mod.
+    compileOnly 'com.github.cabaletta:baritone:1.2.15'
+}
+
+jar {
+    manifest {
+        attributes([
+            'Specification-Title'     : 'Mimesis',
+            'Specification-Vendor'    : 'MahyAss',
+            'Specification-Version'   : '1',
+            'Implementation-Title'    : project.name,
+            'Implementation-Version'  : project.jar.archiveVersion,
+            'Implementation-Vendor'   : 'MahyAss',
+            'Implementation-Timestamp': new Date().format("yyyy-MM-dd'T'HH:mm:ssZ")
+        ])
+    }
+}
+
+publishing {
+    publications {
+        mavenJava(MavenPublication) {
+            artifact jar
+        }
+    }
+    repositories {
+        maven {
+            url "file:///${project.projectDir}/mcmodsrepo"
+        }
+    }
+}

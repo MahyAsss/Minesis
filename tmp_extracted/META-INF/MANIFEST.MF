@@ -1,0 +1,9 @@
+Manifest-Version: 1.0
+Implementation-Title: Mimesis
+Implementation-Version: 1.0.4
+Specification-Vendor: MahyAss
+Specification-Title: Mimesis
+Implementation-Timestamp: 2026-05-27T23:43:08+0200
+Specification-Version: 1
+Implementation-Vendor: MahyAss
+

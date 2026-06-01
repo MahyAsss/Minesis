@@ -1,0 +1,5 @@
+Manifest-Version: 1.0
+Specification-Title: Mimesis
+Specification-Vendor: MahyAss
+Implementation-Title: Mimesis Mod
+Implementation-Vendor: MahyAss
