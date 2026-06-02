@@ -12,6 +12,11 @@ java {
     toolchain.languageVersion = JavaLanguageVersion.of(17)
 }
 
+// Ensure UTF-8 encoding for Java compilation (fix Windows default encoding issues)
+tasks.withType(org.gradle.api.tasks.compile.JavaCompile) {
+    options.encoding = 'UTF-8'
+}
+
 minecraft {
     mappings channel: 'official', version: '1.20.1'
     
