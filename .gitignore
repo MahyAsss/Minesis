@@ -29,3 +29,5 @@ dist/
 target/
 .env
 .env.local
+jdk17/
+temurin17.zip
