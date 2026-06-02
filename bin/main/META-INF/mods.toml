@@ -27,8 +27,10 @@ side="BOTH"
 
 [[dependencies.mimesis]]
 modId="voicechat"
-mandatory=true
+# Make voicechat optional for development environments without Simple Voice Chat installed
+mandatory=false
 # Accept voicechat versions that include the Minecraft prefix (e.g. 1.20.1-2.6.17)
 versionRange="[1.20.1-2.6.17,)"
 ordering="AFTER"
 side="BOTH"
+
