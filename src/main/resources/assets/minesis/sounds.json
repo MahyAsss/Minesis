@@ -1,0 +1,42 @@
+{
+  "minesis_hurt": {
+    "sounds": [
+      {
+        "name": "minesis:minesis_hurt",
+        "stream": true
+      }
+    ]
+  },
+  "minesis_scream": {
+    "sounds": [
+      {
+        "name": "minesis:minesis_scream",
+        "stream": true
+      }
+    ]
+  },
+  "minesis_singing": {
+    "sounds": [
+      {
+        "name": "minesis:minesis_singing",
+        "stream": true
+      }
+    ]
+  },
+  "minesis_transform": {
+    "sounds": [
+      {
+        "name": "minesis:minesis_transform",
+        "stream": false
+      }
+    ]
+  },
+  "minesis_ambient": {
+    "sounds": [
+      {
+        "name": "minesis:minesis_ambient",
+        "stream": false
+      }
+    ]
+  }
+}

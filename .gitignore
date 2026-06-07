@@ -12,6 +12,7 @@ run/
 .DS_Store
 *.class
 *.jar
+!gradle/wrapper/gradle-wrapper.jar
 *.log
 *.o
 *.so

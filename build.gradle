@@ -4,18 +4,15 @@ plugins {
     id 'net.minecraftforge.gradle' version '5.1.+'
 }
 
-group = 'com.mimesis'
-version = '1.0.5'
-archivesBaseName = 'mimesis'
+group = 'com.minesis'
+version = '1.2.0'
+archivesBaseName = 'minesis'
 
 java {
     toolchain.languageVersion = JavaLanguageVersion.of(17)
 }
 
-// Ensure UTF-8 encoding for Java compilation (fix Windows default encoding issues)
-tasks.withType(org.gradle.api.tasks.compile.JavaCompile) {
-    options.encoding = 'UTF-8'
-}
+compileJava.options.encoding = 'UTF-8'
 
 minecraft {
     mappings channel: 'official', version: '1.20.1'
@@ -27,7 +24,7 @@ minecraft {
             property 'forge.logging.level.net.minecraftforge', 'debug'
             args '--username', 'Developer'
             mods {
-                mimesis {
+                minesis {
                     source sourceSets.main
                 }
             }
@@ -38,7 +35,7 @@ minecraft {
             property 'forge.logging.level.net.minecraftforge', 'debug'
             args '--nogui'
             mods {
-                mimesis {
+                minesis {
                     source sourceSets.main
                 }
             }
@@ -60,7 +57,7 @@ repositories {
 }
 
 dependencies {
-    minecraft 'net.minecraftforge:forge:1.20.1-47.2.0'
+    minecraft 'net.minecraftforge:forge:1.20.1-47.4.10'
 
     // Simple Voice Chat API (compile-time only, runtime provided by the mod)
     compileOnly 'de.maxhenkel.voicechat:voicechat-api:2.6.13'
@@ -73,7 +70,7 @@ dependencies {
 jar {
     manifest {
         attributes([
-            'Specification-Title'     : 'Mimesis',
+            'Specification-Title'     : 'Minesis',
             'Specification-Vendor'    : 'MahyAss',
             'Specification-Version'   : '1',
             'Implementation-Title'    : project.name,
@@ -96,3 +93,4 @@ publishing {
         }
     }
 }
+

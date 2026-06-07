@@ -3,29 +3,29 @@ loaderVersion="[47,)"
 license="MIT"
 
 [[mods]]
-modId="mimesis"
-version="1.0.5"
-displayName="Mimesis"
-logoFile="assets/mimesis/logo.png"
+modId="minesis"
+version="1.2.0"
+displayName="Minesis"
+logoFile="assets/minesis/logo.png"
 credits="MahyAss"
 authors="MahyAss"
 description="A horror mod that spawns entity clones that mimic player voices and behavior using Simple Voice Chat integration."
 
-[[dependencies.mimesis]]
+[[dependencies.minesis]]
 modId="forge"
 mandatory=true
 versionRange="[47,)"
 ordering="NONE"
 side="BOTH"
 
-[[dependencies.mimesis]]
+[[dependencies.minesis]]
 modId="minecraft"
 mandatory=true
 versionRange="[1.20.1,1.21)"
 ordering="NONE"
 side="BOTH"
 
-[[dependencies.mimesis]]
+[[dependencies.minesis]]
 modId="voicechat"
 # Make voicechat optional for development environments without Simple Voice Chat installed
 mandatory=false
