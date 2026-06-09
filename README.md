@@ -1,99 +1,126 @@
-# Mimesis - Minecraft Forge Mod 1.20.1
+# Minesis — Minecraft Forge Mod 1.20.1
 
-A horror mod for Minecraft Forge 1.20.1 that spawns entity clones that mimic player voices and behavior using Simple Voice Chat API integration.
+A horror mod for Minecraft Forge 1.20.1 that spawns entity clones mimicking player appearance, voice, and behavior using Simple Voice Chat API integration.
+
+> **All Rights Reserved** — © Clément Mahy (MahyAss)
+
+---
 
 ## Features
 
 ### Core Entity
-- **MimesisEntity**: A custom monster entity that copies player appearance and behavior
-- Copies player skin dynamically
-- Inherits player name and display
-- Spawns in proximity to target player
+- Copies the target player's skin, name, and inventory appearance dynamically
+- Mimics player-like movement: wanders, interacts with chests, crafts, chops wood, mines ores
+- Avoids water and only moves on solid ground
+- Plays a dramatic 3-second transformation when turning hostile
+- Custom hunt model with procedural animations (walk, attack, transform, tentacles)
 
-### Voice Integration (Simple Voice Chat API)
-- Records and stores player voice clips (audio streams)
-- Stores audio by player UUID
-- Replays voice clips periodically
-- Entity can "speak" using recorded player voices
-- Audio storage with size limits (max 5 clips per player)
+### Voice Integration (Simple Voice Chat)
+- Records and stores player voice clips via the Simple Voice Chat API
+- Replays recorded clips periodically as ambient speech
+- Plays direct voice responses when the player speaks nearby
+- Configurable RMS noise threshold to filter out background noise
+- Clips are cleared when the entity dies or the player disconnects
 
-### Behavior
-- **Phase 1 (0-30 seconds)**: Entity follows player without attacking
-  - Tracks player position
-  - Faces player
-  - Occasionally replays voice clips
-  
-- **Phase 2 (30+ seconds)**: Entity becomes hostile
-  - Switches to melee attack mode
-  - Attacks the target player
-  - Fully aggressive behavior
+### Behavior Phases
 
-### Technical Implementation
+**Phase 1 — Passive (configurable, default 1–3 minutes after spawn):**
+- Wanders the area, mimicking daily activities (chest interactions, crafting, chopping, mining)
+- Replays voice clips autonomously every 10–20 minutes
+- Does not attack
 
-#### Custom Goals
-- `MimesisFollowGoal`: Navigation and tracking logic
-- `MimesisAttackGoal`: Hostile behavior and attack logic
+**Phase 2 — Hostile (after the delay):**
+- 3-second freeze with screen darkening, particles, and lightning
+- Hunt model revealed with transform animation as screen clears
+- Lunges toward the player, melee attacks
+- Breaks or opens doors/obstacles to reach the player
+- Teleports if stuck for too long (enderman-style)
 
-#### Voice Management
-- `VoiceManager`: Central voice chat integration point
-- `VoiceCaptureHandler`: Per-player voice capture
-- `VoiceStorage`: Audio clip storage and retrieval
+### World Interaction
+- Opens chests and barrels; 30% chance to deposit an *Echoes Below* music disc
+- Chops trees, mines ores, interacts with crafting tables and furnaces
+- Places cobblestone bridges when blocked in hostile mode
+- Never breaks containers, ore blocks, or log blocks as "obstacles"
 
-#### Rendering
-- `MimesisEntityRenderer`: Custom renderer that copies player skin
-- Dynamic skin loading from player UUID
+---
 
 ## Commands
 
-```
-/mimesis spawn        - Spawn a Mimesis entity near you
-/mimesis clear        - Remove all Mimesis entities
-/mimesis help         - Show command help
-```
+All commands require operator permissions (level 2+).
+
+| Command | Description |
+|---|---|
+| `/minesis me` | Spawn a Minesis clone of yourself |
+| `/minesis spawnname <player>` | Spawn a clone of another player (by name) |
+| `/minesis voicestatus` | Show voice clip count and API status for your player |
+| `/minesis test` | Debug: display voice stats |
+| `/minesis fakevoiceclip` | Debug: inject a synthetic voice clip |
+
+---
 
 ## Configuration
 
-Voice clips configuration:
-- **MAX_CLIPS_PER_PLAYER**: 5 clips (keep recent recordings)
-- **VOICE_CLIP_MAX_DURATION**: 3000ms (3 seconds per clip)
-- **VOICE_REPLAY_INTERVAL**: 100 ticks (5 seconds between replays)
-- **HOSTILE_ACTIVATION_TIME**: 600 ticks (30 seconds to become hostile)
+Config file: `config/minesis-common.toml` (created automatically on first launch).
+
+### `[hostile_behavior]`
+
+| Key | Default | Description |
+|---|---|---|
+| `min_hostile_delay_seconds` | `60` | Minimum seconds before Minesis can turn hostile |
+| `max_hostile_delay_seconds` | `180` | Maximum seconds before Minesis turns hostile |
+| `transformation_screen_effects` | `true` | Apply blindness/darkness/nausea to nearby players during transformation |
+
+### `[voice]`
+
+| Key | Default | Description |
+|---|---|---|
+| `voice_replay_min_seconds` | `600` | Minimum seconds between ambient voice replays |
+| `voice_replay_max_seconds` | `1200` | Maximum seconds between ambient voice replays |
+| `speech_rms_threshold` | `0.02` | RMS energy threshold — clips below this are treated as silence |
+
+### `[world_interaction]`
+
+| Key | Default | Description |
+|---|---|---|
+| `chest_disc_drop_chance` | `0.30` | Probability Minesis deposits an *Echoes Below* disc when opening a chest |
+| `natural_appearance_min_clips` | `50` | Minimum recorded voice clips required before Minesis can spawn naturally |
+
+---
 
 ## Requirements
 
 - Minecraft 1.20.1
 - Forge 47.2.0+
 - Java 17+
-- Simple Voice Chat mod (optional, but recommended for full voice features)
+- [Simple Voice Chat](https://www.curseforge.com/minecraft/mc-mods/simple-voice-chat) (optional — voice features require it)
 
 ## Installation
 
-1. Download the Mimesis mod JAR
-2. Place in your `mods` folder
-3. Run Minecraft with Forge
-4. The mod will auto-detect Simple Voice Chat if installed
+1. Download the Minesis mod JAR
+2. Place it in your `mods/` folder
+3. Launch Minecraft with Forge 1.20.1
+4. Adjust `config/minesis-common.toml` to your preference
+5. Simple Voice Chat is auto-detected if installed
 
-## Audio Stream Integration
-
-The mod is designed to work with Simple Voice Chat API. When a player speaks:
-
-1. Audio is captured from the voice chat stream
-2. Short clips are stored in memory (5 per player)
-3. MimesisEntity replays these clips periodically
-4. Clips are cleared when entity dies or player leaves
+---
 
 ## Entity Statistics
 
-- **Type**: Monster
-- **Size**: 0.6 x 1.8 blocks (human-like)
-- **Tracking Range**: 10 blocks
-- **Update Interval**: 3 ticks
-- **XP Reward**: 50 XP on death
+| Property | Value |
+|---|---|
+| Type | Monster (MISC) |
+| Size | 0.6 × 1.8 blocks |
+| Base Health | 20 HP |
+| Tracking Range | 10 blocks |
+| Update Interval | 3 ticks |
+| XP on death | None |
+
+---
 
 ## Mod ID
 
-`mimesis`
+`minesis`
 
 ## Version
 
-1.0.0 - Initial Release
+`1.2.0`
