@@ -1,5 +1,6 @@
 package com.minesis.client;
 
+import net.minecraft.util.Mth;
 import net.minecraft.client.model.HumanoidModel;
 import net.minecraft.client.model.PlayerModel;
 import net.minecraft.client.model.geom.ModelLayers;
@@ -69,10 +70,36 @@ public class MinesisEntityRenderer extends LivingEntityRenderer<MinesisEntity, P
     public void render(MinesisEntity entity, float entityYaw, float partialTick,
             PoseStack poseStack, MultiBufferSource buffer, int packedLight) {
         this.model = entity.isHostileModeActive() ? this.huntModel : resolvePlayerModel(entity);
-        super.render(entity, entityYaw, partialTick, poseStack, buffer, packedLight);
+
+        int tt = entity.getTransformTimer();
+        MultiBufferSource renderBuffer = buffer;
+        if (tt > 0) {
+            float progress  = (60 - tt) / 60.0F;         // 0 → 1 as freeze runs out
+            float brightness = 1.0F - progress * 0.9F;   // 1.0 → 0.1 (quasi-noir en fin)
+            renderBuffer = type -> new DarkenedConsumer(buffer.getBuffer(type), brightness);
+        }
+
+        super.render(entity, entityYaw, partialTick, poseStack, renderBuffer, packedLight);
         if (entity.isSpeaking() && this.entityRenderDispatcher.distanceToSqr(entity) < 4096.0) {
             renderSpeakerIcon(entity.getDisplayName(), entity.getNameTagOffsetY(), poseStack, buffer, packedLight);
         }
+    }
+
+    /** Wraps a VertexConsumer and multiplies each vertex color by {@code f}. */
+    private static final class DarkenedConsumer implements VertexConsumer {
+        private final VertexConsumer base;
+        private final float f;
+        DarkenedConsumer(VertexConsumer base, float f) { this.base = base; this.f = f; }
+
+        @Override public VertexConsumer vertex(double x, double y, double z)     { base.vertex(x, y, z);           return this; }
+        @Override public VertexConsumer color(int r, int g, int b, int a)        { base.color((int)(r*f),(int)(g*f),(int)(b*f),a); return this; }
+        @Override public VertexConsumer uv(float u, float v)                     { base.uv(u, v);                  return this; }
+        @Override public VertexConsumer overlayCoords(int u, int v)              { base.overlayCoords(u, v);       return this; }
+        @Override public VertexConsumer uv2(int u, int v)                        { base.uv2(u, v);                 return this; }
+        @Override public VertexConsumer normal(float x, float y, float z)        { base.normal(x, y, z);           return this; }
+        @Override public void endVertex()                                         { base.endVertex(); }
+        @Override public void defaultColor(int r, int g, int b, int a)           { base.defaultColor((int)(r*f),(int)(g*f),(int)(b*f),a); }
+        @Override public void unsetDefaultColor()                                 { base.unsetDefaultColor(); }
     }
 
     private void renderSpeakerIcon(Component name, float yOffset,
@@ -198,6 +225,36 @@ public class MinesisEntityRenderer extends LivingEntityRenderer<MinesisEntity, P
     }
 
     // ── Rendering overrides ───────────────────────────────────────────────────
+
+    /**
+     * Replicates the swimming body-tilt from PlayerRenderer.setupRotations().
+     * LivingEntityRenderer does not include this rotation, so without this override
+     * the entity stands upright even when Pose.SWIMMING is active.
+     *
+     * No pivot translation: the entity origin stays at its feet, and the -90° rotation
+     * around X lays the body flat (head points in the movement direction).
+     * Using a fixed -90° avoids the mob's variable head pitch skewing the angle.
+     */
+    @Override
+    protected void setupRotations(MinesisEntity entity, PoseStack poseStack,
+            float ageInTicks, float rotationYaw, float partialTick) {
+        // Apply yaw FIRST so the subsequent X tilt works in the entity's local frame,
+        // not world space. Reversing this order causes the body to spin (kebab effect)
+        // because XP then acts on a non-yawed coordinate system.
+        super.setupRotations(entity, poseStack, ageInTicks, rotationYaw, partialTick);
+        if (entity.isSwimming()) {
+            float swimAmount = entity.getSwimAmount(partialTick);
+            if (swimAmount > 0.0F) {
+                poseStack.mulPose(com.mojang.math.Axis.XP.rotationDegrees(swimAmount * -90.0F));
+            }
+        }
+        int tt = entity.getTransformTimer();
+        if (tt > 0) {
+            float progress = (60 - tt) / 60.0F; // 0 at start → ~1 at end
+            float shake = Mth.sin(ageInTicks * 4.0F) * 0.05F * (0.3F + 0.7F * progress);
+            poseStack.translate(shake, 0.0F, 0.0F);
+        }
+    }
 
     @Override
     protected RenderType getRenderType(MinesisEntity entity, boolean bodyVisible,

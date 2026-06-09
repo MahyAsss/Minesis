@@ -1,9 +1,14 @@
 package com.minesis;
 
+import java.util.Comparator;
 import java.util.Random;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import com.minesis.voice.MinesisVoiceChatPlugin;
+import com.minesis.voice.PlayerActivityTracker;
+import com.minesis.voice.VoiceContext;
+import com.minesis.voice.VoicePlaybackService;
 import com.minesis.voice.VoiceStorage;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -12,6 +17,7 @@ import net.minecraftforge.event.level.BlockEvent;
 import net.minecraftforge.event.RegisterCommandsEvent;
 import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.event.server.ServerStartingEvent;
+import net.minecraftforge.event.entity.living.LivingHurtEvent;
 import com.minesis.voice.VoicePersistenceManager;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.fml.common.Mod;
@@ -24,6 +30,7 @@ import net.minecraft.world.level.block.state.BlockState;
 
 import com.minesis.entity.MinesisEntity;
 import com.minesis.entity.MinesisEntities;
+import com.minesis.utils.MinesisConfig;
 import com.minesis.commands.MinesisCommand;
 import com.minesis.util.MojangAPI;
 import net.minecraft.commands.CommandSourceStack;
@@ -39,9 +46,14 @@ public class ServerEvents {
     private static final long SPAWN_INTERVAL_MIN_MS = 15L * 60L * 1000L; // 15 minutes
     private static final long SPAWN_INTERVAL_MAX_MS = 60L * 60L * 1000L; // 60 minutes
     private static final Map<UUID, Long> nextSpawnAttemptTimes = new ConcurrentHashMap<>();
-    private static final int NATURAL_APPEARANCE_MIN_CLIPS = 50;
     private static final double NATURAL_APPEARANCE_MIN_DISTANCE_SQR = 64.0D * 64.0D;
     private static final int MAX_VERTICAL_SPAWN_DIFF = 5;
+
+    // Speech-response trigger (SVC-based, no Vosk required)
+    private static final Map<UUID, Long> lastSpeechResponseTime = new ConcurrentHashMap<>();
+    private static final long SPEECH_RESPONSE_COOLDOWN_MS = 8_000L; // 8s between responses
+    private static final long SPEECH_END_MIN_MS  = 500L;  // silence must last at least 500ms
+    private static final long SPEECH_END_MAX_MS  = 3_000L; // but player spoke within 3s
 
     private static boolean hasAnyMinesisOnServer(ServerLevel level) {
         if (level.getServer() == null) {
@@ -343,7 +355,7 @@ public class ServerEvents {
         for (ServerPlayer candidate : server.getPlayerList().getPlayers()) {
             if (candidate == targetPlayer) continue;
             if (candidate.level() == level && candidate.distanceToSqr(targetPlayer) < NATURAL_APPEARANCE_MIN_DISTANCE_SQR) continue;
-            if (VoiceStorage.getClipCount(candidate.getUUID()) < NATURAL_APPEARANCE_MIN_CLIPS) continue;
+            if (VoiceStorage.getClipCount(candidate.getUUID()) < MinesisConfig.NATURAL_APPEARANCE_MIN_CLIPS.get()) continue;
             eligible.add(candidate);
         }
         if (eligible.isEmpty()) return null;
@@ -432,7 +444,7 @@ public class ServerEvents {
         final Player appearanceSource = findDistantAppearanceSource(victim);
         if (appearanceSource == null) {
             source.sendSuccess(() -> Component.literal(P + "§cSpawn failed — no eligible player found to copy appearance from (must have §e"
-                    + NATURAL_APPEARANCE_MIN_CLIPS + "+§c clips and be far enough away)."), false);
+                    + MinesisConfig.NATURAL_APPEARANCE_MIN_CLIPS.get() + "+§c clips and be far enough away)."), false);
             return;
         }
         final String sourceName = appearanceSource.getName().getString();
@@ -486,18 +498,96 @@ public class ServerEvents {
             for (Player player : level.players()) {
                 if (player.level().isClientSide) continue;
                 UUID uuid = player.getUUID();
+
+                // ── Natural spawn scheduling ──────────────────────────────
                 Long nextAttempt = nextSpawnAttemptTimes.get(uuid);
                 if (nextAttempt == null) {
                     scheduleNextSpawnAttempt(uuid, now);
-                    continue;
+                } else if (now >= nextAttempt) {
+                    scheduleNextSpawnAttempt(uuid, now);
+                    if (RANDOM.nextInt(100) < SPAWN_ATTEMPT_CHANCE) {
+                        spawnNaturalMinesisNearPlayer(player);
+                    }
                 }
-                if (now < nextAttempt) continue;
-                scheduleNextSpawnAttempt(uuid, now);
-                if (RANDOM.nextInt(100) < SPAWN_ATTEMPT_CHANCE) {
-                    spawnNaturalMinesisNearPlayer(player);
+
+                // ── SVC speech-end response trigger ───────────────────────
+                // Fires when the player just stopped talking (SVC-detected),
+                // bypassing Vosk entirely so the entity always responds.
+                boolean wasSpeaking = PlayerActivityTracker.hasRecentlySpoken(uuid, SPEECH_END_MAX_MS);
+                boolean justStopped = wasSpeaking && !PlayerActivityTracker.hasRecentlySpoken(uuid, SPEECH_END_MIN_MS);
+                if (!justStopped) continue;
+
+                Long lastResp = lastSpeechResponseTime.get(uuid);
+                if (lastResp != null && now - lastResp < SPEECH_RESPONSE_COOLDOWN_MS) continue;
+
+                MinesisEntity entity = level.getEntitiesOfClass(
+                        MinesisEntity.class,
+                        player.getBoundingBox().inflate(20.0)
+                ).stream().min(Comparator.comparingDouble(e -> e.distanceToSqr(player))).orElse(null);
+                if (entity == null) continue;
+
+                UUID voiceUUID = entity.getAppearancePlayerUUID() != null
+                        ? entity.getAppearancePlayerUUID() : entity.getTargetPlayerUUID();
+                if (voiceUUID == null || !VoiceStorage.hasVoiceClips(voiceUUID)) continue;
+
+                de.maxhenkel.voicechat.api.VoicechatServerApi api = MinesisVoiceChatPlugin.getVoicechatApi();
+                VoiceContext ctx = playerVoiceContext((ServerPlayer) player);
+                boolean played = VoicePlaybackService.playVoiceClipForQuery(
+                        entity, voiceUUID, api, ctx, "");
+                if (played) {
+                    lastSpeechResponseTime.put(uuid, now);
+                    entity.notifyResponseTriggered();
                 }
             }
         }
+    }
+
+    private static VoiceContext playerVoiceContext(ServerPlayer player) {
+        UUID uuid = player.getUUID();
+
+        // Container-based (highest priority — intent is unambiguous)
+        if (player.containerMenu instanceof net.minecraft.world.inventory.FurnaceMenu
+                || player.containerMenu instanceof net.minecraft.world.inventory.BlastFurnaceMenu
+                || player.containerMenu instanceof net.minecraft.world.inventory.SmokerMenu)
+            return VoiceContext.SMELTING;
+        if (player.containerMenu instanceof net.minecraft.world.inventory.CraftingMenu)
+            return VoiceContext.CRAFTING;
+
+        // Recent damage
+        if (PlayerActivityTracker.isHurt(uuid))
+            return VoiceContext.HURT;
+
+        // Fleeing: sprinting away from a nearby hostile mob
+        if (player.isSprinting() && hasNearbyHostileMob(player, 16.0))
+            return VoiceContext.FLEEING;
+
+        // Block-interaction activities
+        if (PlayerActivityTracker.isWoodcutting(uuid))
+            return VoiceContext.WOODCUTTING;
+        if (PlayerActivityTracker.isMining(uuid))
+            return VoiceContext.MINING;
+        if (PlayerActivityTracker.isBuilding(uuid))
+            return VoiceContext.BUILDING;
+        if (PlayerActivityTracker.isFarming(uuid))
+            return VoiceContext.FARMING;
+
+        // Movement
+        if (player.isSwimming() || player.isUnderWater())
+            return VoiceContext.SWIMMING;
+        if (player.isSprinting())
+            return VoiceContext.RUNNING;
+        Vec3 vel = player.getDeltaMovement();
+        if (vel.x * vel.x + vel.z * vel.z > 0.005D)
+            return VoiceContext.WALKING;
+        return VoiceContext.IDLE;
+    }
+
+    private static boolean hasNearbyHostileMob(Player player, double range) {
+        return !player.level().getEntitiesOfClass(
+                net.minecraft.world.entity.monster.Monster.class,
+                player.getBoundingBox().inflate(range),
+                e -> !(e instanceof MinesisEntity)
+        ).isEmpty();
     }
 
     private static void scheduleNextSpawnAttempt(UUID uuid, long now) {
@@ -521,10 +611,47 @@ public class ServerEvents {
             }
         }
 
-        // Track player mining activity for voice context tagging
+        // Track player block-break activity for voice context tagging
         if (event.getPlayer() instanceof net.minecraft.server.level.ServerPlayer sp) {
-            com.minesis.voice.PlayerActivityTracker.markMining(sp.getUUID());
+            net.minecraft.world.level.block.Block broken =
+                    event.getLevel().getBlockState(event.getPos()).getBlock();
+            if (isLogBlock(broken)) {
+                PlayerActivityTracker.markWoodcutting(sp.getUUID());
+            } else if (isCropBlock(broken)) {
+                PlayerActivityTracker.markFarming(sp.getUUID());
+            } else {
+                PlayerActivityTracker.markMining(sp.getUUID());
+            }
         }
+    }
+
+    @SubscribeEvent
+    public static void onLivingHurt(LivingHurtEvent event) {
+        if (event.getEntity().level().isClientSide()) return;
+        if (event.getEntity() instanceof ServerPlayer sp) {
+            PlayerActivityTracker.markHurt(sp.getUUID());
+        }
+    }
+
+    @SubscribeEvent
+    public static void onBlockPlace(BlockEvent.EntityPlaceEvent event) {
+        if (event.getLevel().isClientSide()) return;
+        if (event.getEntity() instanceof ServerPlayer sp) {
+            PlayerActivityTracker.markBuilding(sp.getUUID());
+        }
+    }
+
+    private static boolean isLogBlock(net.minecraft.world.level.block.Block block) {
+        return block.defaultBlockState().is(net.minecraft.tags.BlockTags.LOGS);
+    }
+
+    private static boolean isCropBlock(net.minecraft.world.level.block.Block block) {
+        return block instanceof net.minecraft.world.level.block.CropBlock
+                || block instanceof net.minecraft.world.level.block.StemBlock
+                || block instanceof net.minecraft.world.level.block.NetherWartBlock
+                || block instanceof net.minecraft.world.level.block.SweetBerryBushBlock
+                || block == net.minecraft.world.level.block.Blocks.MELON
+                || block == net.minecraft.world.level.block.Blocks.PUMPKIN;
     }
 
     /**

@@ -3,6 +3,9 @@ package com.minesis.client;
 import com.minesis.entity.MinesisEntity;
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
+import net.minecraft.client.animation.AnimationChannel;
+import net.minecraft.client.animation.AnimationDefinition;
+import net.minecraft.client.animation.Keyframe;
 import net.minecraft.client.model.PlayerModel;
 import net.minecraft.client.model.geom.ModelLayerLocation;
 import net.minecraft.client.model.geom.ModelPart;
@@ -14,6 +17,12 @@ import net.minecraft.client.model.geom.builders.MeshDefinition;
 import net.minecraft.client.model.geom.builders.PartDefinition;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.util.Mth;
+import org.joml.Vector3f;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 
 public class MinesisHuntModel extends PlayerModel<MinesisEntity> {
 
@@ -46,10 +55,10 @@ public class MinesisHuntModel extends PlayerModel<MinesisEntity> {
     private final ModelPart huntRightTentacle2;
     private final ModelPart huntRightTentacle3;
 
-    // Animation state
-    private int  attackTimer    = 0;
-    private int  transformTimer = 0;
-    private boolean wasHostile  = false;
+    // Bone-name → ModelPart cache (populated lazily on first lookup)
+    private final Map<String, Optional<ModelPart>> boneCache = new HashMap<>();
+    // Shared scratch vector — rendering is single-threaded so this is safe
+    private static final Vector3f ANIM_VEC = new Vector3f();
 
     public MinesisHuntModel(ModelPart root) {
         super(root, false);
@@ -209,90 +218,100 @@ public class MinesisHuntModel extends PlayerModel<MinesisEntity> {
         return LayerDefinition.create(mesh, 128, 128);
     }
 
+    /**
+     * Finds a named part anywhere under huntRoot, using the same strategy as
+     * HierarchicalModel.getAnyDescendantWithName(): stream all parts, find any that
+     * has a child with the given name, then return that child. Results are cached.
+     */
+    private Optional<ModelPart> findPart(String name) {
+        return boneCache.computeIfAbsent(name, n ->
+            this.huntRoot.getAllParts()
+                .filter(p -> p.hasChild(n))
+                .findFirst()
+                .map(p -> p.getChild(n))
+        );
+    }
+
+    /**
+     * Applies an AnimationDefinition to this model's parts. Replicates the logic
+     * of KeyframeAnimations.animate() without requiring HierarchicalModel.
+     * accumulatedMs is the AnimationState.getAccumulatedTime() value (milliseconds).
+     */
+    private void animateDef(AnimationDefinition def, long accumulatedMs) {
+        float raw = (float) accumulatedMs / 1000.0F;
+        final float elapsed = def.looping() ? raw % def.lengthInSeconds() : raw;
+
+        for (Map.Entry<String, List<AnimationChannel>> entry : def.boneAnimations().entrySet()) {
+            Optional<ModelPart> optPart = findPart(entry.getKey());
+            if (!optPart.isPresent()) continue;
+            ModelPart part = optPart.get();
+            for (AnimationChannel ch : entry.getValue()) {
+                Keyframe[] frames = ch.keyframes();
+                int i = Math.max(0, Mth.binarySearch(0, frames.length,
+                        idx -> elapsed <= frames[idx].timestamp()) - 1);
+                int j = Math.min(frames.length - 1, i + 1);
+                float t = elapsed - frames[i].timestamp();
+                float alpha = (j != i)
+                        ? Mth.clamp(t / (frames[j].timestamp() - frames[i].timestamp()), 0.0F, 1.0F)
+                        : 0.0F;
+                frames[j].interpolation().apply(ANIM_VEC, alpha, frames, i, j, 1.0F);
+                ch.target().apply(part, ANIM_VEC);
+            }
+        }
+    }
+
     @Override
     public void setupAnim(MinesisEntity entity, float limbSwing, float limbSwingAmount,
             float ageInTicks, float netHeadYaw, float headPitch) {
 
-        // Reset fields that are only written conditionally, so they don't linger
-        // between frames. head.y/z must be restored to their PartPose values.
-        this.huntHead.y             = -12.0F;
-        this.huntHead.z             = -11.7F;
-        this.huntRightArm.yRot      = 0.0F;
-        this.huntRightArm.zRot      = 0.0F;
-        this.huntLowerRightArm.xRot = 0.0F;
-        this.huntHip.xRot           = 0.0F;
-        this.huntUpper.xRot         = 0.0F;
-        this.huntMiddle.xRot        = 0.0F;
-        this.huntLower.xRot         = 0.0F;
-        this.huntTentacles.xRot     = 0.0F;
+        // Reset all parts to their baked PartPose so animation offsets accumulate
+        // from a clean baseline rather than lingering from the previous frame.
+        this.huntRoot.getAllParts().forEach(ModelPart::resetPose);
 
-        // ── head_shake: rapid continuous twitch ──────────────────────────────
-        // 0.25s period → 2π/5 ticks ≈ 1.2566 rad/tick
-        float hs = ageInTicks * 1.2566F;
-        this.huntHead.yRot = Mth.sin(hs)        * 0.17F;
-        this.huntHead.zRot = Mth.sin(hs * 1.5F) * 0.26F;
-        this.huntHead.xRot = Mth.cos(hs * 2.0F) * 0.13F;
+        // ── Looping states: always active while the hunt model is visible ────
+        entity.huntHeadShakeState.startIfStopped(entity.tickCount);
+        entity.huntTentaclesState.startIfStopped(entity.tickCount);
 
-        // ── tentacles_jiggle: wave oscillating around each tentacle's baked rest zRot ──
-        // 2s period → 2π/40 ticks ≈ 0.1571 rad/tick
-        // Left roots baked at zRot=1.9199, right roots at zRot=1.2217
-        float tj = ageInTicks * 0.1571F;
-        this.huntLeftTentacle1.zRot  = 1.9199F + Mth.sin(tj)                 * 0.35F;
-        this.huntLeftTentacle2.zRot  = 1.9199F + Mth.sin(tj + 0.5F)          * 0.35F;
-        this.huntLeftTentacle3.zRot  = 1.9199F + Mth.sin(tj + 1.0F)          * 0.35F;
-        this.huntRightTentacle1.zRot = 1.2217F + Mth.sin(tj + Mth.PI)        * 0.35F;
-        this.huntRightTentacle2.zRot = 1.2217F + Mth.sin(tj + Mth.PI + 0.5F) * 0.35F;
-        this.huntRightTentacle3.zRot = 1.2217F + Mth.sin(tj + Mth.PI + 1.0F) * 0.35F;
+        // ── Walk: only when the entity is actually moving ────────────────────
+        entity.huntWalkState.animateWhen(limbSwingAmount > 0.01F, entity.tickCount);
 
-        // ── walk: legs and arms keyed by limbSwing ───────────────────────────
-        float walkSwing = Mth.cos(limbSwing * 0.6662F) * 1.4F * limbSwingAmount;
-        this.huntLeftLeg.xRot   =  walkSwing;
-        this.huntRightLeg.xRot  = -walkSwing;
-        this.huntLeftArm.xRot   = -walkSwing;
-        this.huntRightArm.xRot  =  walkSwing;
-        float lowerKick = Mth.clamp(-walkSwing * 0.55F, -0.218F, 0.742F);
-        this.huntLowerLeftLeg.xRot  = lowerKick;
-        this.huntLowerRightLeg.xRot = -lowerKick;
-
-        // ── attack: arm swing triggered by entity swing ──────────────────────
-        if (entity.swinging && this.attackTimer <= 0) {
-            this.attackTimer = 16;
-        }
-        if (this.attackTimer > 0) {
-            float t          = (16 - this.attackTimer) / 16.0F;
-            float swingCurve = Mth.sin(t * Mth.PI);
-            this.huntRightArm.xRot      += swingCurve * 1.994F;
-            this.huntRightArm.yRot       = -swingCurve * 0.390F;
-            this.huntRightArm.zRot       =  swingCurve * 0.701F;
-            this.huntLowerRightArm.xRot  =  swingCurve * 0.960F;
-            this.attackTimer--;
+        // ── Attack: trigger on the first frame of a swing ────────────────────
+        if (entity.swinging && !entity.huntAttackState.isStarted()) {
+            entity.huntAttackState.start(entity.tickCount);
         }
 
-        // ── transform: one-shot body-rise on hostile activation ──────────────
-        boolean hostile = entity.isHostileModeActive();
-        if (hostile && !this.wasHostile) {
-            this.transformTimer = 40;
+        // ── Transform intro: plays once when hostile mode first activates ────
+        if (!entity.huntTransformAnimPlayed) {
+            entity.huntTransformState.start(entity.tickCount);
+            entity.huntTransformAnimPlayed = true;
         }
-        this.wasHostile = hostile;
-        if (this.transformTimer > 0) {
-            // p goes 0→1 as the timer counts down 40→1
-            float p = 1.0F - (this.transformTimer / 40.0F);
-            // Head: offset from raised (−4Y, +14Z) to rest; extra 50° tilt
-            this.huntHead.y    += Mth.lerp(p, -4.0F,  0.0F);
-            this.huntHead.z    += Mth.lerp(p, 14.0F,  0.0F);
-            this.huntHead.xRot += Mth.lerp(p,  0.873F, 0.0F);
-            // Arms
-            this.huntLeftArm.xRot  += Mth.lerp(p, -0.584F, 0.0F);
-            this.huntRightArm.xRot += Mth.lerp(p, -0.523F, 0.0F);
-            // Body chain unfolds
-            this.huntHip.xRot    = Mth.lerp(p, -0.393F, 0.0F);
-            this.huntUpper.xRot  = Mth.lerp(p, -0.524F, 0.0F);
-            this.huntMiddle.xRot = Mth.lerp(p, -0.916F, 0.0F);
-            this.huntLower.xRot  = Mth.lerp(p, -1.091F, 0.0F);
-            // Tentacles swept down from raised position
-            this.huntTentacles.xRot = Mth.lerp(p, -1.004F, 0.0F);
-            this.transformTimer--;
-        }
+
+        // Advance all states by the current entity age
+        entity.huntHeadShakeState.updateTime(ageInTicks, 1.0F);
+        entity.huntTentaclesState.updateTime(ageInTicks, 1.0F);
+        entity.huntWalkState.updateTime(ageInTicks, 1.0F);
+        entity.huntAttackState.updateTime(ageInTicks, 1.0F);
+        entity.huntTransformState.updateTime(ageInTicks, 1.0F);
+
+        // Apply animations — order matters: later animations override earlier ones
+        entity.huntHeadShakeState.ifStarted(s ->
+                animateDef(MinesisAnimation.HEAD_SHAKE, s.getAccumulatedTime()));
+        entity.huntTentaclesState.ifStarted(s ->
+                animateDef(MinesisAnimation.TENTACLES_JIGGLE, s.getAccumulatedTime()));
+        entity.huntWalkState.ifStarted(s ->
+                animateDef(MinesisAnimation.WALK, s.getAccumulatedTime()));
+        entity.huntAttackState.ifStarted(s -> {
+            animateDef(MinesisAnimation.ATTACK, s.getAccumulatedTime());
+            if (s.getAccumulatedTime() >= (long)(MinesisAnimation.ATTACK.lengthInSeconds() * 1000L)) {
+                entity.huntAttackState.stop();
+            }
+        });
+        entity.huntTransformState.ifStarted(s -> {
+            animateDef(MinesisAnimation.TRANSFORM, s.getAccumulatedTime());
+            if (s.getAccumulatedTime() >= (long)(MinesisAnimation.TRANSFORM.lengthInSeconds() * 1000L)) {
+                entity.huntTransformState.stop();
+            }
+        });
     }
 
     @Override

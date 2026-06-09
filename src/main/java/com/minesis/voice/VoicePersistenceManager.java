@@ -69,23 +69,77 @@ public class VoicePersistenceManager {
             LOGGER.error("[Minesis] Cannot create voices directory: {}", e.getMessage());
         }
         lastCleanupMs = System.currentTimeMillis();
+        loadAllClips();
+    }
+
+    /**
+     * Loads all raw PCM clips saved to disk back into VoiceStorage.
+     * Called on server start so clips survive restarts.
+     */
+    public static void loadAllClips() {
+        Path dir = voicesDir;
+        if (dir == null || !Files.exists(dir)) return;
+        int loaded = 0;
+        try {
+            for (Path playerDir : Files.list(dir).filter(Files::isDirectory).toList()) {
+                UUID playerUUID;
+                try { playerUUID = UUID.fromString(playerDir.getFileName().toString()); }
+                catch (IllegalArgumentException e) { continue; }
+
+                try {
+                    for (Path pcmFile : Files.list(playerDir)
+                            .filter(f -> f.getFileName().toString().endsWith(".pcm"))
+                            .toList()) {
+                        try {
+                            String name = pcmFile.getFileName().toString();
+                            // filename: <timestamp>_<CONTEXT>.pcm
+                            String base = name.substring(0, name.length() - 4); // strip .pcm
+                            int sep = base.lastIndexOf('_');
+                            VoiceContext ctx = VoiceContext.IDLE;
+                            if (sep >= 0) {
+                                try { ctx = VoiceContext.valueOf(base.substring(sep + 1)); }
+                                catch (IllegalArgumentException ignored) {}
+                            }
+                            byte[] pcm = Files.readAllBytes(pcmFile);
+                            VoiceStorage.loadVoiceClip(playerUUID, pcm, ctx);
+                            loaded++;
+                        } catch (Exception e) {
+                            LOGGER.debug("[Minesis] Skipping corrupt PCM file {}: {}", pcmFile, e.getMessage());
+                        }
+                    }
+                } catch (Exception e) {
+                    LOGGER.debug("[Minesis] Error reading voice dir for {}: {}", playerUUID, e.getMessage());
+                }
+            }
+        } catch (Exception e) {
+            LOGGER.error("[Minesis] Failed to list voices directory: {}", e.getMessage());
+        }
+        if (loaded > 0)
+            LOGGER.info("[Minesis] Loaded {} voice clip(s) from disk.", loaded);
+        else
+            LOGGER.debug("[Minesis] No PCM clips found on disk (first run or clips recorded before this version).");
     }
 
     // ── Save ────────────────────────────────────────────────────────────────
 
     public static void saveClip(UUID playerUUID, byte[] pcm, VoiceContext context) {
         Path dir = voicesDir;
-        VoicechatServerApi api = voicechatApi;
-        if (dir == null || api == null || pcm == null || pcm.length == 0) return;
+        if (dir == null || pcm == null || pcm.length == 0) return;
 
+        VoicechatServerApi api = voicechatApi;
         SAVE_EXECUTOR.submit(() -> {
             try {
                 Path playerDir = dir.resolve(playerUUID.toString());
                 Files.createDirectories(playerDir);
-                String fileName = System.currentTimeMillis() + "_" + context.name() + ".ogg";
-                byte[] oggData = encodeOggOpus(pcm, api);
-                if (oggData != null) {
-                    Files.write(playerDir.resolve(fileName), oggData);
+                String base = System.currentTimeMillis() + "_" + context.name();
+
+                // Raw PCM — always saved, used for reload on next startup
+                Files.write(playerDir.resolve(base + ".pcm"), pcm);
+
+                // OGG Opus — saved when SVC API is available (for external playback)
+                if (api != null) {
+                    byte[] oggData = encodeOggOpus(pcm, api);
+                    if (oggData != null) Files.write(playerDir.resolve(base + ".ogg"), oggData);
                 }
             } catch (Exception e) {
                 LOGGER.debug("[Minesis] Failed to save voice clip for {}: {}", playerUUID, e.getMessage());

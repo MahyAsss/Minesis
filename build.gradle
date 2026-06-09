@@ -44,16 +44,8 @@ minecraft {
 }
 
 repositories {
-    maven {
-        url 'https://maven.maxhenkel.de/releases'
-    }
-}
-
-// Baritone is provided at runtime via JitPack — used optionally through reflection
-repositories {
-    maven {
-        url 'https://jitpack.io'
-    }
+    maven { url 'https://maven.maxhenkel.de/releases' }
+    maven { url 'https://jitpack.io' }
 }
 
 dependencies {
@@ -65,9 +57,19 @@ dependencies {
     // Baritone API (compile-time only). The Baritone mod must be installed on the client
     // similar to Simple Voice Chat; we don't bundle the runtime JAR into our mod.
     compileOnly 'com.github.cabaletta:baritone:1.2.15'
+
+    // Vosk Java API — on the compile classpath and bundled into the mod JAR below.
+    implementation files('libs/vosk-0.3.45.jar')
 }
 
 jar {
+    // Bundle Vosk classes + its embedded native libs (win32-x86-64, linux-x86-64, darwin).
+    // LibVosk.class handles extraction to a temp dir and System.load() automatically.
+    from(zipTree('libs/vosk-0.3.45.jar')) {
+        exclude 'META-INF/**'
+    }
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+
     manifest {
         attributes([
             'Specification-Title'     : 'Minesis',

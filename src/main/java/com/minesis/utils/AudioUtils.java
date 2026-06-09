@@ -41,6 +41,25 @@ public class AudioUtils {
     public static boolean isValidAudioData(byte[] audioData) {
         return audioData != null && audioData.length > 0 && audioData.length % 2 == 0;
     }
+
+    /**
+     * Computes the RMS of a 16-bit PCM clip, normalized to [0, 1] (1 = max amplitude).
+     * Returns 0 for null/empty/odd-length input.
+     */
+    public static float computeRms(byte[] pcmBytes) {
+        if (pcmBytes == null || pcmBytes.length < 2) return 0f;
+        int sampleCount = pcmBytes.length / 2;
+        long sumSq = 0;
+        for (int i = 0; i < sampleCount; i++) {
+            // Little-endian 16-bit sample
+            int lo = pcmBytes[i * 2]     & 0xFF;
+            int hi = pcmBytes[i * 2 + 1] & 0xFF;
+            short s = (short) (lo | (hi << 8));
+            sumSq += (long) s * s;
+        }
+        double rms = Math.sqrt((double) sumSq / sampleCount);
+        return (float) (rms / 32768.0);
+    }
     
     /**
      * Trim audio to maximum duration

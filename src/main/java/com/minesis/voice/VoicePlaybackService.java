@@ -1,5 +1,6 @@
 package com.minesis.voice;
 
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -11,126 +12,161 @@ import de.maxhenkel.voicechat.api.VoicechatServerApi;
 import de.maxhenkel.voicechat.api.audiochannel.AudioChannel;
 import de.maxhenkel.voicechat.api.audiochannel.AudioPlayer;
 import de.maxhenkel.voicechat.api.opus.OpusEncoder;
-import net.minecraft.server.level.ServerLevel;
 
-/**
- * Handles playback of stored voice clips through Voice Chat API
- */
 public class VoicePlaybackService {
+
+    // Keyed by entity UUID — presence in map means "currently playing"
     private static final Map<UUID, AudioPlayer> activePlayers = new ConcurrentHashMap<>();
-    private static VoicechatServerApi voicechatApi = null;
-    // historique des 3 derniers clips joués par entité (anti-répétition)
     private static final Map<UUID, java.util.Deque<Integer>> clipHistoryByEntity = new ConcurrentHashMap<>();
     private static final int CLIP_HISTORY_SIZE = 3;
 
-    public static void setVoicechatApi(VoicechatServerApi api) {
-        voicechatApi = api;
+    public static void setVoicechatApi(VoicechatServerApi api) { /* kept for API compat */ }
+
+    /** True if this entity already has a clip playing. */
+    public static boolean isPlaying(UUID entityId) {
+        return activePlayers.containsKey(entityId);
     }
 
-    /**
-     * Play a voice clip from a stored source through a Minesis entity
-     */
-    public static void playVoiceClip(MinesisEntity minesisEntity, UUID sourcePlayerUUID,
-            VoicechatServerApi api, VoiceContext context) {
-        if (api == null || minesisEntity == null || minesisEntity.level().isClientSide) {
-            return;
-        }
+    // ─── Public entry points ──────────────────────────────────────────────
 
-        java.util.Deque<Integer> history = clipHistoryByEntity.computeIfAbsent(
-                minesisEntity.getUUID(), k -> new java.util.ArrayDeque<>());
-        byte[] audioData = null;
-        int attempts = 0;
-        while (attempts < 8) {
-            audioData = VoiceStorage.getClipForContext(sourcePlayerUUID, context);
-            if (audioData == null || audioData.length == 0) return;
-            int h = java.util.Arrays.hashCode(audioData);
+    /** Autonomous tick-based playback — selects by activity context. */
+    public static void playVoiceClip(MinesisEntity entity, UUID sourceUUID,
+            VoicechatServerApi api, VoiceContext context) {
+        if (!canPlay(entity, api)) return;
+
+        java.util.Deque<Integer> history = historyFor(entity.getUUID());
+        byte[] audio = null;
+        for (int attempt = 0; attempt < 8; attempt++) {
+            byte[] candidate = VoiceStorage.getClipForContext(sourceUUID, context);
+            if (candidate == null || candidate.length == 0) return;
+            int h = java.util.Arrays.hashCode(candidate);
             if (!history.contains(h)) {
                 history.addLast(h);
                 if (history.size() > CLIP_HISTORY_SIZE) history.removeFirst();
+                audio = candidate;
                 break;
             }
-            attempts++;
         }
-        if (audioData == null || audioData.length == 0) return;
+        if (audio == null) audio = VoiceStorage.getClipForContext(sourceUUID, context);
+        if (audio == null || audio.length == 0) return;
 
+        doPlay(entity, api, audio);
+    }
+
+    /** Triggered by a player's voice query — uses transcript-based selection.
+     *  Returns true if a clip actually started playing. */
+    public static boolean playVoiceClipForQuery(MinesisEntity entity, UUID sourceUUID,
+            VoicechatServerApi api, VoiceContext context, String queryText) {
+        if (!canPlay(entity, api)) return false;
+
+        List<byte[]> candidates = VoiceStorage.getCandidatesForQuery(sourceUUID, context, queryText);
+        if (candidates.isEmpty()) return false;
+
+        java.util.Deque<Integer> history = historyFor(entity.getUUID());
+        byte[] audio = null;
+        for (byte[] candidate : candidates) {
+            int h = java.util.Arrays.hashCode(candidate);
+            if (!history.contains(h)) {
+                history.addLast(h);
+                if (history.size() > CLIP_HISTORY_SIZE) history.removeFirst();
+                audio = candidate;
+                break;
+            }
+        }
+        if (audio == null) audio = candidates.get(0); // all already in history, play anyway
+
+        doPlay(entity, api, audio);
+        return true;
+    }
+
+    /** Triggered by "what are you doing?" — picks first-person clips matching entity's current activity.
+     *  Returns true if a clip actually started playing. */
+    public static boolean playVoiceClipForSelfDescription(MinesisEntity entity, UUID sourceUUID,
+            VoicechatServerApi api, VoiceContext entityContext) {
+        if (!canPlay(entity, api)) return false;
+
+        List<byte[]> candidates = VoiceStorage.getCandidatesForSelfDescription(sourceUUID, entityContext);
+        if (candidates.isEmpty()) return false;
+
+        java.util.Deque<Integer> history = historyFor(entity.getUUID());
+        byte[] audio = null;
+        for (byte[] candidate : candidates) {
+            int h = java.util.Arrays.hashCode(candidate);
+            if (!history.contains(h)) {
+                history.addLast(h);
+                if (history.size() > CLIP_HISTORY_SIZE) history.removeFirst();
+                audio = candidate;
+                break;
+            }
+        }
+        if (audio == null) audio = candidates.get(0);
+        doPlay(entity, api, audio);
+        return true;
+    }
+
+    // ─── Internal helpers ─────────────────────────────────────────────────
+
+    private static boolean canPlay(MinesisEntity entity, VoicechatServerApi api) {
+        if (api == null || entity == null || entity.level().isClientSide) return false;
+        return !isPlaying(entity.getUUID()); // reject if already speaking
+    }
+
+    private static java.util.Deque<Integer> historyFor(UUID entityId) {
+        return clipHistoryByEntity.computeIfAbsent(entityId, k -> new java.util.ArrayDeque<>());
+    }
+
+    private static void doPlay(MinesisEntity entity, VoicechatServerApi api, byte[] audioData) {
         try {
-            // Create entity audio channel
-            UUID channelId = UUID.randomUUID();
-            de.maxhenkel.voicechat.api.Entity voicechatEntity = api.fromEntity(minesisEntity);
-            AudioChannel audioChannel = api.createEntityAudioChannel(channelId, voicechatEntity);
-            if (audioChannel == null) {
-                return;
-            }
+            UUID entityId = entity.getUUID();
+            de.maxhenkel.voicechat.api.Entity vcEntity = api.fromEntity(entity);
+            AudioChannel channel = api.createEntityAudioChannel(UUID.randomUUID(), vcEntity);
+            if (channel == null) return;
 
-            // Encode audio to Opus
             OpusEncoder encoder = api.createEncoder();
-            if (encoder == null || encoder.isClosed()) {
-                return;
-            }
+            if (encoder == null || encoder.isClosed()) return;
 
-            // Convert PCM bytes to shorts
-            short[] pcmShorts = AudioUtils.bytesToShorts(audioData);
-            if (minesisEntity.isHostileModeActive()) {
-                pcmShorts = applyHostileVoiceEffect(pcmShorts);
-            }
+            short[] pcm = AudioUtils.bytesToShorts(audioData);
+            if (entity.isHostileModeActive()) pcm = applyHostileVoiceEffect(pcm);
 
-            // Create audio player with direct audio data
-            AudioPlayer player = api.createAudioPlayer(audioChannel, encoder, pcmShorts);
-            if (player == null) {
-                encoder.close();
-                return;
-            }
+            AudioPlayer player = api.createAudioPlayer(channel, encoder, pcm);
+            if (player == null) { encoder.close(); return; }
 
-            // Store and start playback
-            UUID playerId = UUID.randomUUID();
-            activePlayers.put(playerId, player);
-
+            activePlayers.put(entityId, player);
             player.setOnStopped(() -> {
-                activePlayers.remove(playerId);
+                activePlayers.remove(entityId);
                 encoder.close();
             });
-
             player.startPlaying();
         } catch (Exception e) {
             System.err.println("[Minesis] Error playing voice clip: " + e.getMessage());
-            e.printStackTrace();
         }
     }
 
+    // ─── Misc ─────────────────────────────────────────────────────────────
+
     public static void stopAllPlayback() {
-        for (AudioPlayer player : activePlayers.values()) {
-            if (player != null && player.isPlaying()) {
-                player.stopPlaying();
-            }
+        for (AudioPlayer p : activePlayers.values()) {
+            if (p != null && p.isPlaying()) p.stopPlaying();
         }
         activePlayers.clear();
     }
 
-    public static int getActivePlayerCount() {
-        return activePlayers.size();
-    }
+    public static int getActivePlayerCount() { return activePlayers.size(); }
 
-    private static short[] applyHostileVoiceEffect(short[] pcmShorts) {
-        short[] transformed = new short[pcmShorts.length];
-        int previous = 0;
-        int[] reverbTail = new int[2205];
-
-        for (int i = 0; i < pcmShorts.length; i++) {
-            int sample = pcmShorts[i];
-            int delayed = reverbTail[i % reverbTail.length];
-            int filtered = (int) (previous * 0.68D + sample * 0.32D);
-            filtered = (int) (filtered * 0.84D) + (delayed / 3);
-            filtered = (int) Math.max(Short.MIN_VALUE, Math.min(Short.MAX_VALUE, filtered));
-
-            if ((i & 63) == 0) {
-                filtered = (int) (filtered * 0.92D);
-            }
-
-            transformed[i] = (short) filtered;
-            previous = filtered;
-            reverbTail[i % reverbTail.length] = (int) (filtered * 0.45D);
+    private static short[] applyHostileVoiceEffect(short[] pcm) {
+        short[] out = new short[pcm.length];
+        int prev = 0;
+        int[] reverb = new int[2205];
+        for (int i = 0; i < pcm.length; i++) {
+            int s = pcm[i];
+            int filtered = (int) (prev * 0.68 + s * 0.32);
+            filtered = (int) (filtered * 0.84) + (reverb[i % reverb.length] / 3);
+            filtered = Math.max(Short.MIN_VALUE, Math.min(Short.MAX_VALUE, filtered));
+            if ((i & 63) == 0) filtered = (int) (filtered * 0.92);
+            out[i] = (short) filtered;
+            prev = filtered;
+            reverb[i % reverb.length] = (int) (filtered * 0.45);
         }
-
-        return transformed;
+        return out;
     }
 }

@@ -8,15 +8,20 @@ import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.event.lifecycle.FMLClientSetupEvent;
 
 import com.minesis.entity.MinesisEntities;
+import com.minesis.voice.vosk.VoskManager;
+import net.minecraft.client.Minecraft;
 
 @Mod.EventBusSubscriber(modid = "minesis", bus = Mod.EventBusSubscriber.Bus.MOD, value = Dist.CLIENT)
 public class ClientInitializer {
 
     @SubscribeEvent
     public static void onClientSetup(FMLClientSetupEvent event) {
-        // Nametag compatibility with mods like YDM's MobHealthBar is handled via
-        // MinesisEntityRenderer.shouldShowName(), which overrides any mixin that
-        // LivingEntityRenderer-level mods may inject. No event hook needed here.
+        // Start Vosk ASR in background — downloads native lib + model on first run,
+        // then begins microphone capture. Non-blocking; logs progress to console.
+        event.enqueueWork(() -> {
+            java.io.File gameDir = Minecraft.getInstance().gameDirectory;
+            VoskManager.initialize(gameDir);
+        });
     }
 
     @SubscribeEvent

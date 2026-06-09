@@ -36,6 +36,20 @@ public class VoiceNetworking {
                 .encoder(JumpscarePacket::encode)
                 .consumerMainThread(JumpscarePacket::handle)
                 .add();
+
+        // Vosk: client sends recognized text → server picks voice clip
+        INSTANCE.messageBuilder(TranscriptionPacket.class, ID++, NetworkDirection.PLAY_TO_SERVER)
+                .decoder(TranscriptionPacket::decode)
+                .encoder(TranscriptionPacket::encode)
+                .consumerMainThread(TranscriptionPacket::handle)
+                .add();
+
+        // Vosk: client annotates its most recent recorded clip with a transcript
+        INSTANCE.messageBuilder(ClipAnnotationPacket.class, ID++, NetworkDirection.PLAY_TO_SERVER)
+                .decoder(ClipAnnotationPacket::decode)
+                .encoder(ClipAnnotationPacket::encode)
+                .consumerMainThread(ClipAnnotationPacket::handle)
+                .add();
     }
 
     /**

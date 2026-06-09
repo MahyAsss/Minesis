@@ -1,5 +1,6 @@
 package com.minesis.entity;
- 
+
+import com.minesis.utils.MinesisConfig;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.UUID;
@@ -24,6 +25,7 @@ import net.minecraft.world.phys.Vec3;
 import net.minecraft.network.syncher.SynchedEntityData;
 import net.minecraft.network.syncher.EntityDataAccessor;
 import net.minecraft.network.syncher.EntityDataSerializers;
+import net.minecraft.world.entity.AnimationState;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.ai.attributes.AttributeInstance;
 import net.minecraft.world.entity.ai.attributes.AttributeModifier;
@@ -66,8 +68,6 @@ import javax.annotation.Nullable;
  
 public class MinesisEntity extends Monster {
  
-    private static final int MIN_HOSTILE_DELAY_TICKS = 20 * 60;  // 1 minute
-    private static final int MAX_HOSTILE_DELAY_TICKS = 20 * 180; // 3 minutes
     private static final Logger LOGGER = LogManager.getLogger();
  
     // ── Données synchronisées ─────────────────────────────────────────────
@@ -87,6 +87,8 @@ public class MinesisEntity extends Monster {
             SynchedEntityData.defineId(MinesisEntity.class, EntityDataSerializers.STRING);
     private static final EntityDataAccessor<Boolean> SPEAKING =
             SynchedEntityData.defineId(MinesisEntity.class, EntityDataSerializers.BOOLEAN);
+    private static final EntityDataAccessor<Integer> TRANSFORM_TIMER =
+            SynchedEntityData.defineId(MinesisEntity.class, EntityDataSerializers.INT);
  
     // ── Champs internes ───────────────────────────────────────────────────
     private UUID   targetPlayerUUID;
@@ -99,10 +101,8 @@ public class MinesisEntity extends Monster {
     private boolean isHostile            = false;
     private int  voicePlaybackCooldown   = 0;
  
-    private static final int VOICE_REPLAY_INTERVAL_MIN = 400;
-    private static final int VOICE_REPLAY_INTERVAL_MAX = 900;
+    // Autonomous ambient speech interval: very rare — primary trigger is player speech
  
-    private int  speakingIconTimer           = 0;
     private int  armorSyncTimer             = 0;
     private int  hostileMobAggroTimer       = 0;
     private int  passiveItemCollectionTimer = 0;
@@ -116,6 +116,18 @@ public class MinesisEntity extends Monster {
     private boolean provokedByMob         = false;
     private int     provokedByMobTimer    = 0;
     private boolean hostilityTransformPlayed = false;
+    private long    lastHurtTimestamp     = 0L;
+
+    // Hunt-model animation states (read by MinesisHuntModel.setupAnim on the client render thread)
+    public final AnimationState huntWalkState        = new AnimationState();
+    public final AnimationState huntHeadShakeState   = new AnimationState();
+    public final AnimationState huntTentaclesState   = new AnimationState();
+    public final AnimationState huntAttackState      = new AnimationState();
+    public final AnimationState huntTransformState   = new AnimationState();
+    public boolean huntTransformAnimPlayed = false;
+
+    // Mineflayer-inspired movement state
+    private boolean wasInWater = false;
     private boolean playCustomHurtSound   = false;
     private boolean singingLoopActive     = false;
     private int     singingLoopTimer      = 0;
@@ -149,17 +161,50 @@ public class MinesisEntity extends Monster {
         this.xpReward = 50;
         this.setHealth(20.0F);
     }
- 
+
+    @Override
+    protected net.minecraft.world.entity.ai.navigation.PathNavigation createNavigation(Level level) {
+        return new net.minecraft.world.entity.ai.navigation.AmphibiousPathNavigation(this, level);
+    }
+
+    @Override
+    public boolean canBreatheUnderwater() { return true; }
+
+    @Override
+    public void updateSwimming() {
+        // Vanilla resets swimming to false every tick when not sprinting.
+        // Force it true whenever we are passively in water so updatePose()
+        // derives Pose.SWIMMING and the breaststroke animation shows.
+        if (this.isInWater() && !this.isHostileModeActive()) {
+            this.setSwimming(true);
+        } else {
+            super.updateSwimming();
+        }
+    }
+
     public boolean isProvokedByPlayer()      { return this.provokedByPlayer; }
     public boolean isProvokedByMob()         { return this.provokedByMob;    }
     public boolean isTransformationFreezing(){ return this.transformationFreezeTimer > 0; }
 
     public void setVoiceContext(VoiceContext ctx) { this.voiceContext = ctx; }
 
-    private VoiceContext computePlaybackContext() {
-        if (this.isHostileModeActive())  return VoiceContext.COMBAT;
+    /** Returns the context that best describes what the entity is currently doing. Public so TranscriptionPacket can read it. */
+    public VoiceContext computePlaybackContext() {
+        if (this.isHostileModeActive()) return VoiceContext.COMBAT;
         if (this.isSwimming() || this.isUnderWater()) return VoiceContext.SWIMMING;
-        return this.voiceContext; // set by the movement goal at each state transition
+        // Recently hurt (within 3 s) — not faking, not in combat
+        if (System.currentTimeMillis() - this.lastHurtTimestamp < 3_000L) return VoiceContext.HURT;
+        // Threatened by a mob but not yet in hostile mode → fleeing
+        if (this.provokedByMob && this.provokedByMobTimer > 0) return VoiceContext.FLEEING;
+        // Cooking station active
+        if (this.cookingStationPos != null) return VoiceContext.SMELTING;
+        // At crafting table
+        if (this.atCraftingStation) return VoiceContext.CRAFTING;
+        // Infer woodcutting vs mining from held tool
+        ItemStack hand = this.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.MAINHAND);
+        if (this.voiceContext == VoiceContext.MINING && hand.getItem() instanceof net.minecraft.world.item.AxeItem)
+            return VoiceContext.WOODCUTTING;
+        return this.voiceContext; // set by movement goal at each state transition
     }
 
     public void startCrouch(int ticks) {
@@ -212,15 +257,13 @@ public class MinesisEntity extends Monster {
         this.entityData.define(SKIN_TEXTURE_PROPERTIES, "");
         this.entityData.define(SKIN_MODEL,              "");
         this.entityData.define(SPEAKING,                false);
+        this.entityData.define(TRANSFORM_TIMER,         0);
     }
  
     // ── Enregistrement des Goals ──────────────────────────────────────────
  
     @Override
     protected void registerGoals() {
-        // 0 : flotter dans l'eau (toujours en premier)
-        this.goalSelector.addGoal(0, new FloatGoal(this));
- 
         // 1 : combat contre mobs hostiles proches
         this.goalSelector.addGoal(1, new MinesisMobCombatGoal(this, 1.15D));
  
@@ -229,9 +272,6 @@ public class MinesisEntity extends Monster {
  
         // 3 : machine à états principale (comportement joueur)
         this.goalSelector.addGoal(3, new MinesisPlayerLikeMovementGoal(this));
- 
-        // 4 : minage de minerais visibles (complément de la machine à états)
-        this.goalSelector.addGoal(4, new MinesisBlockBreakGoal(this));
  
         // 5 : accroupissement / danse aléatoire
         this.goalSelector.addGoal(5, new MinesisDanceGoal(this));
@@ -266,6 +306,81 @@ public class MinesisEntity extends Monster {
     public void tick() {
         super.tick();
  
+        // Swimming — force pose + Mineflayer-inspired depth physics
+        if (this.isInWater() && !this.isHostileModeActive()) {
+            this.setSprinting(false);
+            this.setPose(Pose.SWIMMING);
+            Vec3 mot = this.getDeltaMovement();
+            BlockPos pos = this.blockPosition();
+            int surfaceY = pos.getY();
+            for (int i = 1; i <= 8; i++) {
+                if (this.level().getFluidState(pos.offset(0, i, 0))
+                        .is(net.minecraft.tags.FluidTags.WATER)) {
+                    surfaceY = pos.getY() + i;
+                } else {
+                    break;
+                }
+            }
+            double targetY = surfaceY + 0.1;
+            double dy = targetY - this.getY();
+            if (dy > 0.05) {
+                // Mineflayer "jump held in water" = +0.04/tick; cap at 0.3
+                this.setDeltaMovement(mot.x, Math.min(mot.y + 0.04, 0.3), mot.z);
+            } else if (dy < -0.2) {
+                this.setDeltaMovement(mot.x, Math.max(mot.y - 0.02, -0.15), mot.z);
+            } else {
+                this.setDeltaMovement(mot.x, mot.y * 0.5, mot.z);
+            }
+            this.wasInWater = true;
+
+            // Mineflayer autoJump: détecter une bordure solide 1 bloc en avant quand on est
+            // à la surface — booster Y pour franchir l'arête sans se bloquer.
+            if (!this.level().isClientSide && Math.abs(dy) < 0.8) {
+                Vec3 curMot = this.getDeltaMovement();
+                double hSpeedSq = curMot.x * curMot.x + curMot.z * curMot.z;
+                if (hSpeedSq > 0.0005) {
+                    double invLen = 1.0 / Math.sqrt(hSpeedSq);
+                    double hx = curMot.x * invLen;
+                    double hz = curMot.z * invLen;
+                    // Bloc juste en avant, au niveau des pieds
+                    BlockPos aheadPos = new BlockPos(
+                        net.minecraft.util.Mth.floor(this.getX() + hx * 1.1),
+                        net.minecraft.util.Mth.floor(this.getY() + 0.2),
+                        net.minecraft.util.Mth.floor(this.getZ() + hz * 1.1));
+                    BlockState aheadState = this.level().getBlockState(aheadPos);
+                    boolean aheadSolid = !aheadState.getCollisionShape(this.level(), aheadPos).isEmpty()
+                                     && aheadState.getFluidState().isEmpty();
+                    if (aheadSolid) {
+                        // Vérifier qu'il y a de la place au dessus (step de 1 bloc max)
+                        BlockPos aboveAhead = aheadPos.above();
+                        boolean headClear = this.level().getBlockState(aboveAhead)
+                            .getCollisionShape(this.level(), aboveAhead).isEmpty();
+                        if (headClear && curMot.y < 0.4) {
+                            this.setDeltaMovement(curMot.x, 0.4, curMot.z);
+                        }
+                    }
+                }
+            }
+        } else {
+            if (this.isSwimming()) this.setSwimming(false);
+            // Force pose reset immediately so the swimming animation stops the same tick
+            if (this.getPose() == net.minecraft.world.entity.Pose.SWIMMING)
+                this.setPose(net.minecraft.world.entity.Pose.STANDING);
+            // Mineflayer outOfLiquidImpulse = 0.3 — pop onto the shore on water exit
+            if (this.wasInWater && !this.isHostileModeActive()) {
+                Vec3 mot = this.getDeltaMovement();
+                if (mot.y < 0.3) this.setDeltaMovement(mot.x, 0.3, mot.z);
+            }
+            this.wasInWater = false;
+        }
+
+        // Ladder / vine climbing: when inside a climbable block, push upward so
+        // the navigation can actually ascend rather than slipping back down.
+        if (!this.isInWater() && !this.isHostileModeActive() && this.onClimbable()) {
+            Vec3 ladderMot = this.getDeltaMovement();
+            if (ladderMot.y < 0.15) this.setDeltaMovement(ladderMot.x, 0.15, ladderMot.z);
+        }
+
         if (!this.level().isClientSide) {
             this.timeSinceSpawn++;
 
@@ -278,11 +393,24 @@ public class MinesisEntity extends Monster {
                     net.minecraft.network.chat.Component.literal(this.targetPlayerName));
             }
 
+            // Nage vers la rive — réévalue toutes les 20 ticks pour court-circuiter le goal
+            if (this.isInWater() && !this.isHostileModeActive() && this.tickCount % 20 == 0) {
+                BlockPos shore = this.findNearestLandPos(24);
+                if (shore != null) {
+                    this.getNavigation().moveTo(shore.getX() + 0.5, shore.getY(), shore.getZ() + 0.5, 4.0);
+                }
+            }
+
             // Pause dramatique lors de la transformation
             if (this.transformationFreezeTimer > 0) {
                 this.transformationFreezeTimer--;
+                this.entityData.set(TRANSFORM_TIMER, this.transformationFreezeTimer);
+                if (this.transformationFreezeTimer == 20) {
+                    // Darkness ends (40 ticks elapsed): reveal hunt model so transform animation begins
+                    this.entityData.set(HOSTILE_MODE, true);
+                }
                 if (this.transformationFreezeTimer == 0) {
-                    // Fin du freeze : jumpscare physique
+                    // End of freeze: lunge toward player
                     net.minecraft.world.entity.LivingEntity jumpTarget = this.getTarget();
                     if (jumpTarget == null) {
                         jumpTarget = this.level().getNearestPlayer(
@@ -314,41 +442,22 @@ public class MinesisEntity extends Monster {
                 if (this.provokedByMobTimer <= 0) this.provokedByMob = false;
             }
  
-            // Répondre si la proie vient de parler (fenêtre 2 s → réponse en 1-2 s)
-            if (!this.isHostileModeActive() && this.voicePlaybackCooldown > 40) {
-                UUID tpUUID2 = this.getTargetPlayerUUID();
-                if (tpUUID2 != null && com.minesis.voice.PlayerActivityTracker.hasRecentlySpoken(tpUUID2, 2000L)) {
-                    this.voicePlaybackCooldown = 20 + this.random.nextInt(20);
-                }
+            // Icône SVC : éteindre dès que la lecture s'arrête
+            if (this.entityData.get(SPEAKING) && !VoicePlaybackService.isPlaying(this.getUUID())) {
+                this.setSpeaking(false);
             }
 
-            // Icône SVC : décrémenter le timer, éteindre quand expiré
-            if (this.speakingIconTimer > 0) {
-                this.speakingIconTimer--;
-                if (this.speakingIconTimer == 0) this.setSpeaking(false);
-            }
-
-            // Playback voix + orientation du regard
+            // Autonomous ambient speech: fires every 1.5–3 min in any context
             if (this.voicePlaybackCooldown <= 0 && this.isAlive()) {
-                this.setSpeaking(true);
-                this.speakingIconTimer = 60; // icône visible 3 s
-                this.attemptVoicePlayback();
-                // Orienter la tête vers le joueur cible au moment de la lecture
-                UUID tpUUID = this.getTargetPlayerUUID();
-                if (tpUUID != null) {
-                    Player tp = this.level().getPlayerByUUID(tpUUID);
-                    if (tp != null) {
-                        double faceY = tp.getY() + tp.getEyeHeight() * 0.82
-                                + (this.random.nextDouble() - 0.5) * 0.4;
-                        this.getLookControl().setLookAt(
-                                tp.getX() + (this.random.nextDouble() - 0.5) * 0.3,
-                                faceY,
-                                tp.getZ() + (this.random.nextDouble() - 0.5) * 0.3,
-                                14.0F, 14.0F);
-                    }
+                if (!VoicePlaybackService.isPlaying(this.getUUID())) {
+                    this.setSpeaking(true);
+                    this.attemptVoicePlayback();
+                    this.voicePlaybackCooldown = MinesisConfig.voiceReplayMinTicks()
+                            + this.random.nextInt(MinesisConfig.voiceReplayMaxTicks() - MinesisConfig.voiceReplayMinTicks() + 1);
+                } else {
+                    // Still playing — check again in 10 ticks
+                    this.voicePlaybackCooldown = 10;
                 }
-                this.voicePlaybackCooldown = VOICE_REPLAY_INTERVAL_MIN
-                        + this.random.nextInt(VOICE_REPLAY_INTERVAL_MAX - VOICE_REPLAY_INTERVAL_MIN + 1);
             } else {
                 this.voicePlaybackCooldown--;
             }
@@ -485,8 +594,14 @@ public class MinesisEntity extends Monster {
  
     public void setHostileMode(boolean hostile) {
         this.isHostile = hostile;
-        this.entityData.set(HOSTILE_MODE, hostile);
-        if (hostile) {
+        if (!hostile) {
+            this.entityData.set(HOSTILE_MODE, false);
+            this.entityData.set(TRANSFORM_TIMER, 0);
+            this.singingLoopActive = false;
+            this.singingLoopTimer  = 0;
+            AttributeInstance atk = this.getAttribute(Attributes.ATTACK_DAMAGE);
+            if (atk != null) atk.removeModifier(HOSTILE_DAMAGE_UUID);
+        } else {
             if (!this.level().isClientSide) this.removeAllStations();
             this.clearNearbyAggro();
             if (!this.singingLoopActive && !this.level().isClientSide) {
@@ -499,16 +614,16 @@ public class MinesisEntity extends Monster {
                 atk.addTransientModifier(HOSTILE_DAMAGE_BONUS);
             }
             this.clearArmorSlots();
-        } else {
-            this.singingLoopActive = false;
-            this.singingLoopTimer  = 0;
-            AttributeInstance atk = this.getAttribute(Attributes.ATTACK_DAMAGE);
-            if (atk != null) atk.removeModifier(HOSTILE_DAMAGE_UUID);
-        }
-        if (hostile && !this.hostilityTransformPlayed) {
-            this.transformationFreezeTimer = 60; // pause dramatique 3s avant de charger
-            this.playTransformationEffects();
-            this.hostilityTransformPlayed = true;
+            if (!this.hostilityTransformPlayed) {
+                // Delay HOSTILE_MODE=true: client shows shake animation on player skin first
+                this.entityData.set(TRANSFORM_TIMER, 60);
+                this.transformationFreezeTimer = 60;
+                this.playTransformationEffects();
+                this.hostilityTransformPlayed = true;
+            } else {
+                // Already transformed before: activate hunt model immediately
+                this.entityData.set(HOSTILE_MODE, true);
+            }
         }
     }
  
@@ -522,8 +637,8 @@ public class MinesisEntity extends Monster {
         this.entityData.set(TARGET_PLAYER_UUID, targetPlayerUUID.toString());
         this.entityData.set(TARGET_PLAYER_NAME, targetPlayerName);
         this.timeSinceSpawn    = 0;
-        this.hostileActivationTime = MIN_HOSTILE_DELAY_TICKS
-                + this.random.nextInt(MAX_HOSTILE_DELAY_TICKS - MIN_HOSTILE_DELAY_TICKS + 1);
+        this.hostileActivationTime = MinesisConfig.minHostileDelayTicks()
+                + this.random.nextInt(MinesisConfig.maxHostileDelayTicks() - MinesisConfig.minHostileDelayTicks() + 1);
         this.hostilityTransformPlayed = false;
         this.appearancePlayerUUID = player.getUUID();
         this.entityData.set(APPEARANCE_PLAYER_UUID, this.appearancePlayerUUID.toString());
@@ -552,8 +667,8 @@ public class MinesisEntity extends Monster {
         this.entityData.set(TARGET_PLAYER_NAME,     playerName);
         this.entityData.set(APPEARANCE_PLAYER_UUID, "");
         this.timeSinceSpawn = 0;
-        this.hostileActivationTime = MIN_HOSTILE_DELAY_TICKS
-                + this.random.nextInt(MAX_HOSTILE_DELAY_TICKS - MIN_HOSTILE_DELAY_TICKS + 1);
+        this.hostileActivationTime = MinesisConfig.minHostileDelayTicks()
+                + this.random.nextInt(MinesisConfig.maxHostileDelayTicks() - MinesisConfig.minHostileDelayTicks() + 1);
         this.hostilityTransformPlayed = false;
         this.setHostileMode(false);
         this.setCustomName(net.minecraft.network.chat.Component.literal(playerName));
@@ -564,6 +679,7 @@ public class MinesisEntity extends Monster {
     public void setAppearanceFromPlayer(Player player) {
         if (player == null) return;
         this.appearancePlayerUUID = player.getUUID();
+        this.allowVoicePlayback = true;
         this.entityData.set(APPEARANCE_PLAYER_UUID, this.appearancePlayerUUID.toString());
         this.copyPlayerArmor(player);
         this.setCustomName(player.getDisplayName());
@@ -615,8 +731,8 @@ public class MinesisEntity extends Monster {
         this.entityData.set(TARGET_PLAYER_UUID,  this.targetPlayerUUID.toString());
         this.entityData.set(TARGET_PLAYER_NAME,  this.targetPlayerName);
         this.timeSinceSpawn    = 0;
-        this.hostileActivationTime = MIN_HOSTILE_DELAY_TICKS
-                + this.random.nextInt(MAX_HOSTILE_DELAY_TICKS - MIN_HOSTILE_DELAY_TICKS + 1);
+        this.hostileActivationTime = MinesisConfig.minHostileDelayTicks()
+                + this.random.nextInt(MinesisConfig.maxHostileDelayTicks() - MinesisConfig.minHostileDelayTicks() + 1);
         this.hostilityTransformPlayed = false;
         this.setCustomNameVisible(false);
         this.appearancePlayerUUID = appearanceSource == null ? null : appearanceSource.getUUID();
@@ -701,15 +817,17 @@ public class MinesisEntity extends Monster {
         if (!(this.level() instanceof ServerLevel sl)) return;
         AABB box = new AABB(pos.getX(), pos.getY(), pos.getZ(),
                 pos.getX() + 1, pos.getY() + 1, pos.getZ() + 1).inflate(1.5D);
+        boolean pickedUp = false;
         for (ItemEntity item : sl.getEntitiesOfClass(ItemEntity.class, box)) {
             if (item != null && !item.isRemoved()) {
                 ItemStack s = item.getItem();
-                if (!s.isEmpty()) this.addToCarriedItems(s.copy());
+                if (!s.isEmpty()) { this.addToCarriedItems(s.copy()); pickedUp = true; }
                 item.remove(net.minecraft.world.entity.Entity.RemovalReason.DISCARDED);
             }
         }
+        if (pickedUp) playItemPickupSound();
     }
- 
+
     private void collectItemsPassively() {
         if (this.level().isClientSide) return;
         if (!(this.level() instanceof ServerLevel sl)) return;
@@ -720,9 +838,17 @@ public class MinesisEntity extends Monster {
                 if (!s.isEmpty()) {
                     this.addToCarriedItems(s.copy());
                     item.remove(net.minecraft.world.entity.Entity.RemovalReason.DISCARDED);
+                    playItemPickupSound();
                 }
             }
         }
+    }
+
+    private void playItemPickupSound() {
+        this.level().playSound(null, this.getX(), this.getY(), this.getZ(),
+            net.minecraft.sounds.SoundEvents.ITEM_PICKUP,
+            net.minecraft.sounds.SoundSource.PLAYERS,
+            0.2F, ((this.random.nextFloat() - this.random.nextFloat()) * 0.7F + 1.0F) * 2.0F);
     }
  
     // ── Sync armure ───────────────────────────────────────────────────────
@@ -831,16 +957,65 @@ public class MinesisEntity extends Monster {
     }
  
     // ── Voix ──────────────────────────────────────────────────────────────
- 
+
+    /** Called by TranscriptionPacket after a triggered response to show the icon and
+     *  reset the autonomous cooldown, preventing a random clip from stepping on the reply. */
+    public void notifyResponseTriggered() {
+        this.setSpeaking(true);
+        this.voicePlaybackCooldown = MinesisConfig.voiceReplayMinTicks()
+                + this.random.nextInt(MinesisConfig.voiceReplayMaxTicks() - MinesisConfig.voiceReplayMinTicks() + 1);
+    }
+
+    /** Scans a radius for the nearest solid non-water ground at roughly the same Y, used for shore navigation. */
+    private BlockPos findNearestLandPos(int radius) {
+        BlockPos center = this.blockPosition();
+        BlockPos best = null;
+        double bestDistSq = Double.MAX_VALUE;
+        for (int dx = -radius; dx <= radius; dx += 2) {
+            for (int dz = -radius; dz <= radius; dz += 2) {
+                int x = center.getX() + dx;
+                int z = center.getZ() + dz;
+                // getHeight returns the first AIR block above the highest motion-blocking block
+                int y = this.level().getHeight(
+                        net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+                // y is air; y-1 is the ground block. Reject cliffs/pits too far from the entity's Y.
+                if (Math.abs((y - 1) - center.getY()) > 4) continue;
+                BlockPos standing = new BlockPos(x, y, z); // air above ground = correct feet position
+                // Must be non-fluid solid ground (not a water surface)
+                if (this.level().getFluidState(standing).isEmpty()
+                        && this.level().getBlockState(standing.below()).isSolid()) {
+                    double d = (x - center.getX()) * (x - center.getX())
+                             + (z - center.getZ()) * (z - center.getZ());
+                    if (d < bestDistSq) { bestDistSq = d; best = standing; }
+                }
+            }
+        }
+        return best;
+    }
+
     private void attemptVoicePlayback() {
         UUID voiceUUID = this.appearancePlayerUUID != null ? this.appearancePlayerUUID : this.getTargetPlayerUUID();
-        if (this.allowVoicePlayback && voiceUUID != null) {
-            try {
-                de.maxhenkel.voicechat.api.VoicechatServerApi api =
-                        com.minesis.voice.MinesisVoiceChatPlugin.getVoicechatApi();
-                if (api != null)
-                    VoicePlaybackService.playVoiceClip(this, voiceUUID, api, computePlaybackContext());
-            } catch (Exception ignored) {}
+        if (voiceUUID == null) {
+            LOGGER.debug("[Minesis] attemptVoicePlayback: voiceUUID is null — entity has no target player");
+            return;
+        }
+        int clips = com.minesis.voice.VoiceStorage.getClipCount(voiceUUID);
+        if (clips == 0) {
+            LOGGER.debug("[Minesis] attemptVoicePlayback: no clips in memory for UUID {} — recordings may not have been loaded", voiceUUID);
+            return;
+        }
+        // Clips are available — always allow playback regardless of how entity was spawned
+        this.allowVoicePlayback = true;
+        de.maxhenkel.voicechat.api.VoicechatServerApi api =
+                com.minesis.voice.MinesisVoiceChatPlugin.getVoicechatApi();
+        if (api == null) {
+            LOGGER.warn("[Minesis] attemptVoicePlayback: Simple Voice Chat API is null — is SVC installed?");
+            return;
+        }
+        try {
+            VoicePlaybackService.playVoiceClip(this, voiceUUID, api, computePlaybackContext());
+        } catch (Exception e) {
+            LOGGER.error("[Minesis] attemptVoicePlayback failed: {}", e.getMessage(), e);
         }
     }
  
@@ -853,11 +1028,13 @@ public class MinesisEntity extends Monster {
         double x = this.getX(), y = this.getY(), z = this.getZ();
 
         // Effets sur les joueurs proches
-        for (Player player : this.level().getEntitiesOfClass(
-                Player.class, this.getBoundingBox().inflate(20.0D))) {
-            player.addEffect(new MobEffectInstance(MobEffects.BLINDNESS,  40, 0, false, false, true));
-            player.addEffect(new MobEffectInstance(MobEffects.DARKNESS,  160, 0, false, false, true));
-            player.addEffect(new MobEffectInstance(MobEffects.CONFUSION,  80, 1, false, false, true));
+        if (MinesisConfig.TRANSFORMATION_SCREEN_EFFECTS.get()) {
+            for (Player player : this.level().getEntitiesOfClass(
+                    Player.class, this.getBoundingBox().inflate(20.0D))) {
+                player.addEffect(new MobEffectInstance(MobEffects.BLINDNESS,  40, 0, false, false, true));
+                player.addEffect(new MobEffectInstance(MobEffects.DARKNESS,   40, 0, false, false, true));
+                player.addEffect(new MobEffectInstance(MobEffects.CONFUSION,  80, 1, false, false, true));
+            }
         }
 
         // Son de transformation
@@ -930,6 +1107,7 @@ public class MinesisEntity extends Monster {
             this.setTarget((net.minecraft.world.entity.LivingEntity) source.getEntity());
             boolean tookDamage = super.hurt(source, amount);
             if (tookDamage && !this.level().isClientSide) {
+                this.lastHurtTimestamp = System.currentTimeMillis();
                 this.setHostileMode(true);
                 if (this.transformationFreezeTimer == 0) {
                     this.teleportNearTargetLikeEnderman();
@@ -950,8 +1128,11 @@ public class MinesisEntity extends Monster {
         }
         this.playCustomHurtSound = this.isHostileModeActive();
         boolean tookDamage = super.hurt(source, amount);
-        if (tookDamage && !this.level().isClientSide && this.isHostileModeActive() && this.transformationFreezeTimer == 0)
-            this.teleportNearTargetLikeEnderman();
+        if (tookDamage && !this.level().isClientSide) {
+            this.lastHurtTimestamp = System.currentTimeMillis();
+            if (this.isHostileModeActive() && this.transformationFreezeTimer == 0)
+                this.teleportNearTargetLikeEnderman();
+        }
         this.playCustomHurtSound = false;
         return tookDamage;
     }
@@ -1036,6 +1217,7 @@ public class MinesisEntity extends Monster {
  
     public boolean isHostile()           { return this.isHostile; }
     public boolean isHostileModeActive() { return this.entityData.get(HOSTILE_MODE); }
+    public int     getTransformTimer()   { return this.entityData.get(TRANSFORM_TIMER); }
     public boolean isSpeaking()          { return this.entityData.get(SPEAKING); }
     public void setSpeaking(boolean b)   { this.entityData.set(SPEAKING, b); }
  

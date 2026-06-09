@@ -31,6 +31,10 @@ public class MinesisSounds {
             SOUNDS.register("minesis_ambient", () -> SoundEvent.createVariableRangeEvent(
                     new ResourceLocation(MinesisMod.MOD_ID, "minesis_ambient")));
 
+    public static final RegistryObject<SoundEvent> ECHOES_BELOW =
+            SOUNDS.register("echoes_below", () -> SoundEvent.createVariableRangeEvent(
+                    new ResourceLocation(MinesisMod.MOD_ID, "echoes_below")));
+
     public static void register(IEventBus eventBus) {
         SOUNDS.register(eventBus);
     }

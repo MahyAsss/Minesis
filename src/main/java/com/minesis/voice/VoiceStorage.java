@@ -11,6 +11,16 @@ public class VoiceStorage {
     // 10 seconds at 48 kHz 16-bit mono
     public static final int MAX_CLIP_BYTES = 960_000;
 
+    /** Loads a clip from disk into memory — does NOT trigger disk persistence again. */
+    public static void loadVoiceClip(UUID playerUUID, byte[] audioData, VoiceContext context) {
+        if (audioData == null || audioData.length < 960) return;
+        int len = Math.min(audioData.length, MAX_CLIP_BYTES);
+        byte[] stored = Arrays.copyOf(audioData, len);
+        VoiceClip clip = new VoiceClip(stored, context == null ? VoiceContext.IDLE : context);
+        playerVoiceClips.computeIfAbsent(playerUUID, k -> new ArrayList<>()).add(clip);
+        updateStatistics(playerUUID, stored);
+    }
+
     public static void storeVoiceClip(UUID playerUUID, byte[] audioData, VoiceContext context) {
         if (audioData == null || audioData.length < 960) return; // <10ms — too short
 
@@ -26,35 +36,166 @@ public class VoiceStorage {
 
     /**
      * Returns audio bytes for a clip whose context best matches the requested one.
-     * Fallback order: exact match → WALKING/RUNNING swap → IDLE → any.
+     * Used by autonomous ambient playback — white noise clips are included.
      */
     public static byte[] getClipForContext(UUID playerUUID, VoiceContext context) {
         List<VoiceClip> clips = playerVoiceClips.get(playerUUID);
         if (clips == null || clips.isEmpty()) return null;
-
-        // 1. Exact match
-        List<byte[]> candidates = collectAudio(clips, context);
-
-        // 2. WALKING ↔ RUNNING swap
-        if (candidates.isEmpty()) {
-            if (context == VoiceContext.RUNNING)  candidates = collectAudio(clips, VoiceContext.WALKING);
-            else if (context == VoiceContext.WALKING) candidates = collectAudio(clips, VoiceContext.RUNNING);
-        }
-
-        // 3. IDLE fallback
-        if (candidates.isEmpty() && context != VoiceContext.IDLE)
-            candidates = collectAudio(clips, VoiceContext.IDLE);
-
-        // 4. Any clip
-        if (candidates.isEmpty())
-            for (VoiceClip c : clips) candidates.add(c.audio);
-
+        List<byte[]> candidates = collectWithFallback(clips, context, false);
         return candidates.get(new Random().nextInt(candidates.size()));
     }
 
-    private static List<byte[]> collectAudio(List<VoiceClip> clips, VoiceContext ctx) {
+    /**
+     * Collects clips for the given context with a semantic fallback chain:
+     *   WOODCUTTING→MINING, SMELTING→CRAFTING, FLEEING→RUNNING,
+     *   BUILDING/FARMING→WALKING, HURT/RUNNING→WALKING swap, then IDLE, then any.
+     *
+     * @param speechOnly if true, skips clips whose RMS is below SPEECH_RMS_THRESHOLD
+     *                   (white noise / background noise captured by SVC).
+     */
+    private static List<byte[]> collectWithFallback(List<VoiceClip> clips, VoiceContext context, boolean speechOnly) {
+        List<byte[]> out = collectAudio(clips, context, speechOnly);
+        if (!out.isEmpty()) return out;
+
+        VoiceContext alias = null;
+        switch (context) {
+            case WOODCUTTING: alias = VoiceContext.MINING;    break;
+            case SMELTING:    alias = VoiceContext.CRAFTING;  break;
+            case FLEEING:     alias = VoiceContext.RUNNING;   break;
+            case BUILDING:
+            case FARMING:     alias = VoiceContext.WALKING;   break;
+            case RUNNING:     alias = VoiceContext.WALKING;   break;
+            case WALKING:     alias = VoiceContext.RUNNING;   break;
+            default:          break;
+        }
+        if (alias != null) out = collectAudio(clips, alias, speechOnly);
+
+        if (out.isEmpty() && context != VoiceContext.IDLE)
+            out = collectAudio(clips, VoiceContext.IDLE, speechOnly);
+
+        // Last resort: any clip (still respecting speechOnly)
+        if (out.isEmpty())
+            for (VoiceClip c : clips)
+                if (!speechOnly || c.isSpeech()) out.add(c.audio);
+
+        // If speechOnly wiped everything, fall back to all clips (better to respond than stay silent)
+        if (out.isEmpty())
+            for (VoiceClip c : clips) out.add(c.audio);
+
+        return out;
+    }
+
+    /**
+     * Annotates the most recent unannotated clip for this player with the given transcript.
+     * Called server-side when a ClipAnnotationPacket arrives from the recording client.
+     */
+    public static void annotateLastClip(UUID playerUUID, String transcript) {
+        List<VoiceClip> clips = playerVoiceClips.get(playerUUID);
+        if (clips == null || clips.isEmpty()) return;
+        synchronized (clips) {
+            for (int i = clips.size() - 1; i >= 0; i--) {
+                if (clips.get(i).transcript.isEmpty()) {
+                    clips.get(i).transcript = transcript;
+                    return;
+                }
+            }
+            // All already annotated — overwrite the last one
+            clips.get(clips.size() - 1).transcript = transcript;
+        }
+    }
+
+    /**
+     * Returns candidates for playback ordered by semantic similarity to queryText.
+     *
+     * Uses FrenchTextAnalyzer for stemming + synonym-aware Jaccard similarity.
+     * Clips with similarity >= TRANSCRIPT_THRESHOLD are returned sorted best-first.
+     * Falls back to context-based selection if no transcripts pass the threshold.
+     */
+    private static final float TRANSCRIPT_THRESHOLD = 0.05f; // minimum score to count as a match
+
+    public static List<byte[]> getCandidatesForQuery(UUID playerUUID, VoiceContext context, String queryText) {
+        List<VoiceClip> clips = playerVoiceClips.get(playerUUID);
+        if (clips == null || clips.isEmpty()) return Collections.emptyList();
+
+        // Score every annotated clip with the semantic similarity function
+        List<float[]> scored = new ArrayList<>(); // [score, index]
+        for (int i = 0; i < clips.size(); i++) {
+            VoiceClip clip = clips.get(i);
+            if (clip.transcript.isEmpty()) continue;
+            float sim = FrenchTextAnalyzer.similarity(queryText, clip.transcript);
+            if (sim >= TRANSCRIPT_THRESHOLD) scored.add(new float[]{sim, i});
+        }
+
+        if (!scored.isEmpty()) {
+            // Sort descending by score; randomise within equal-score tiers
+            scored.sort((a, b) -> Float.compare(b[0], a[0]));
+            // Build candidate list: clips within 15% of the best score are all included
+            float best = scored.get(0)[0];
+            List<byte[]> candidates = new ArrayList<>();
+            for (float[] entry : scored) {
+                if (entry[0] >= best * 0.85f) candidates.add(clips.get((int) entry[1]).audio);
+            }
+            Collections.shuffle(candidates);
+            return candidates;
+        }
+
+        // Fallback: same cascade as getClipForContext, speech-only for responses
+        List<byte[]> fallback = collectWithFallback(clips, context, true);
+        Collections.shuffle(fallback);
+        return fallback;
+    }
+
+    /**
+     * Selects clips for a "what are you doing?" reply.
+     *
+     * Priority:
+     *  1. Clips whose transcript starts with "je" / "j'" AND match the entity's current context.
+     *  2. Any clip starting with "je" / "j'" regardless of context.
+     *  3. Best context match (no transcript filter) as a last resort.
+     */
+    public static List<byte[]> getCandidatesForSelfDescription(UUID playerUUID, VoiceContext entityContext) {
+        List<VoiceClip> clips = playerVoiceClips.get(playerUUID);
+        if (clips == null || clips.isEmpty()) return Collections.emptyList();
+
+        List<byte[]> contextJe = new ArrayList<>();
+        List<byte[]> anyJe     = new ArrayList<>();
+
+        for (VoiceClip clip : clips) {
+            if (!clip.isSpeech()) continue; // skip white noise even for self-description
+            String t = clip.transcript.trim().toLowerCase(java.util.Locale.ROOT);
+            boolean startsJe = t.startsWith("je ") || t.startsWith("j'") || t.startsWith("j ");
+            if (!startsJe) continue;
+            anyJe.add(clip.audio);
+            if (contextCompatible(clip.context, entityContext))
+                contextJe.add(clip.audio);
+        }
+
+        if (!contextJe.isEmpty()) { Collections.shuffle(contextJe); return contextJe; }
+        if (!anyJe.isEmpty())     { Collections.shuffle(anyJe);     return anyJe;     }
+        // No transcribed first-person clips → best context match, speech-only
+        List<byte[]> fallback = collectWithFallback(clips, entityContext, true);
+        Collections.shuffle(fallback);
+        return fallback;
+    }
+
+    /** True if a clip's context is considered a match for the query context (loose). */
+    private static boolean contextCompatible(VoiceContext clip, VoiceContext query) {
+        if (clip == query) return true;
+        switch (query) {
+            case WOODCUTTING: return clip == VoiceContext.MINING;
+            case SMELTING:    return clip == VoiceContext.CRAFTING;
+            case FLEEING:     return clip == VoiceContext.RUNNING;
+            case BUILDING:
+            case FARMING:     return clip == VoiceContext.WALKING;
+            case HURT:        return clip == VoiceContext.IDLE;
+            default:          return false;
+        }
+    }
+
+    private static List<byte[]> collectAudio(List<VoiceClip> clips, VoiceContext ctx, boolean speechOnly) {
         List<byte[]> out = new ArrayList<>();
-        for (VoiceClip c : clips) if (c.context == ctx) out.add(c.audio);
+        for (VoiceClip c : clips)
+            if (c.context == ctx && (!speechOnly || c.isSpeech())) out.add(c.audio);
         return out;
     }
 

@@ -141,11 +141,13 @@ public class MinesisBuildingGoal extends Goal {
     }
 
     private boolean canPlaceBlock(BlockPos pos) {
-        // Check if we can place a block here (only in air or plants)
         net.minecraft.world.level.block.Block block = this.minesis.level().getBlockState(pos).getBlock();
-        return block == Blocks.AIR || block == Blocks.TALL_GRASS || block == Blocks.GRASS || 
+        boolean spaceOk = block == Blocks.AIR || block == Blocks.TALL_GRASS || block == Blocks.GRASS ||
                block == Blocks.SEAGRASS || block == Blocks.DEAD_BUSH || block == Blocks.DANDELION ||
                block == Blocks.POPPY;
+        if (!spaceOk) return false;
+        net.minecraft.world.level.block.state.BlockState below = this.minesis.level().getBlockState(pos.below());
+        return below.canOcclude() && below.getFluidState().isEmpty();
     }
 
     private boolean hasCobblestone() {

@@ -1,7 +1,10 @@
 package com.minesis.ai;
 
+import com.minesis.MinesisItems;
 import com.minesis.entity.MinesisEntity;
+import com.minesis.utils.MinesisConfig;
 import net.minecraft.core.BlockPos;
+import net.minecraft.world.Container;
 import net.minecraft.core.Direction;
 import net.minecraft.sounds.SoundEvents;
 import net.minecraft.sounds.SoundSource;
@@ -79,6 +82,8 @@ public class MinesisPlayerLikeMovementGoal extends Goal {
     // ── Sprint ───────────────────────────────────────────────────────────────
     private int sprintTicks    = 0;
     private int sprintCooldown = 0;
+    // Mineflayer: minimum 10 ticks between jumps to prevent bunny-hopping
+    private int jumpCooldown   = 0;
 
     // ── Item cycling ─────────────────────────────────────────────────────────
     private int         itemScrollTimer    = 0;
@@ -150,6 +155,8 @@ public class MinesisPlayerLikeMovementGoal extends Goal {
         if (chestOpened && chestTarget != null) {
             minesis.level().playSound(null, chestTarget,
                 SoundEvents.CHEST_CLOSE, SoundSource.BLOCKS, 0.5F, 1.0F);
+            Block stopBlock = minesis.level().getBlockState(chestTarget).getBlock();
+            minesis.level().blockEvent(chestTarget, stopBlock, 1, 0);
         }
         destination = null; lastPos = null; idleLookTarget = null;
         recentDests.clear();
@@ -159,6 +166,8 @@ public class MinesisPlayerLikeMovementGoal extends Goal {
     @Override
     public void tick() {
         if (minesis.isHostile() || minesis.isProvokedByPlayer()) return;
+        // Shore navigation and swimming pose handled entirely by MinesisEntity.tick()
+        if (minesis.isInWater()) return;
 
         stateTicks--;
         repathTicks--;
@@ -166,6 +175,7 @@ public class MinesisPlayerLikeMovementGoal extends Goal {
         sprintCooldown--;
         mirrorTimer--;
         chestCooldown--;
+        jumpCooldown--;
 
         switch (state) {
             case IDLE            -> tickIdle();
@@ -258,17 +268,34 @@ public class MinesisPlayerLikeMovementGoal extends Goal {
     private void tickWander() {
         if (destination == null || repathTicks <= 0 || minesis.getNavigation().isDone()) {
             destination = findWanderDestination(8.0D, 20.0D);
-            repathTicks = 8 + minesis.getRandom().nextInt(10);
+            repathTicks = 20 + minesis.getRandom().nextInt(20);
         }
 
-        // Sprint is default; short walk pauses break it up
+        // No sprinting in water — swim at walk speed
+        if (minesis.isInWater()) {
+            minesis.setSprinting(false);
+            minesis.getNavigation().moveTo(destination.x, destination.y, destination.z, SPEED_WALK);
+            if (lookTimer <= 0) { lookTimer = nextLookTimer(); applyWalkingLook(); }
+            return;
+        }
+
+        // Sprint is default on land; short walk pauses break it up
         double speed;
         if (sprintTicks > 0) {
             sprintTicks--;
             speed = SPEED_SPRINT + (minesis.getRandom().nextDouble() - 0.5D) * 0.04D;
             minesis.setSprinting(true);
-            if (minesis.onGround() && minesis.getRandom().nextInt(20) == 0)
-                minesis.getJumpControl().jump();
+            if (minesis.onGround() && jumpCooldown <= 0) {
+                double terrainBoost = calcTerrainJumpBoost();
+                if (terrainBoost > 0 || minesis.getRandom().nextInt(35) == 0) {
+                    double boost = terrainBoost > 0 ? terrainBoost : 0.2;
+                    minesis.getJumpControl().jump();
+                    float yaw = (float) Math.toRadians(minesis.getYRot());
+                    Vec3 cur = minesis.getDeltaMovement();
+                    minesis.setDeltaMovement(cur.x - Math.sin(yaw) * boost, cur.y, cur.z + Math.cos(yaw) * boost);
+                    jumpCooldown = terrainBoost > 0.4 ? 18 : (terrainBoost > 0 ? 14 : 10);
+                }
+            }
             if (sprintTicks <= 0)
                 sprintCooldown = 12 + minesis.getRandom().nextInt(30);
         } else if (sprintCooldown > 0) {
@@ -282,10 +309,18 @@ public class MinesisPlayerLikeMovementGoal extends Goal {
             minesis.setSprinting(true);
         }
 
+        // Sneak at cliff edge (≥ 3-block drop ahead, not about to jump)
+        if (minesis.onGround() && jumpCooldown > 0 == false
+                && calcTerrainJumpBoost() == 0 && isNearCliffEdge()) {
+            speed = SPEED_WALK * 0.5;
+            minesis.setSprinting(false);
+            if (!minesis.isCrouching()) minesis.startCrouch(8 + minesis.getRandom().nextInt(8));
+        }
+
         minesis.getNavigation().moveTo(destination.x, destination.y, destination.z, speed);
 
         if (lookTimer <= 0) {
-            lookTimer = 4 + minesis.getRandom().nextInt(8);
+            lookTimer = nextLookTimer();
             applyWalkingLook();
         }
 
@@ -293,82 +328,168 @@ public class MinesisPlayerLikeMovementGoal extends Goal {
     }
 
     /**
-     * Realistic walking head movement:
-     *   30% ground-check (1.5–3 blocks ahead, foot level)
-     *   25% side glance (±30–65°)
-     *   20% forward (4–8 blocks, slight vertical variation)
-     *   15% distant horizon
-     *   8%  interesting nearby block
-     *   2%  upward glance (as if hearing something)
+     * Human-like walking head movement.
+     *
+     * Three principles applied to every target:
+     *  1. Downward bias  — players look ~5–12° below horizontal, so Y is reduced by
+     *                       distance × 0.09 (tunable per case). Pure horizon = robotic.
+     *  2. Mouse jitter   — small random noise added to X/Y/Z so the look never snaps
+     *                       to an exact coordinate, mimicking imprecise mouse movement.
+     *  3. Variable speed — close targets get full snap speed; slow distant sweeps get
+     *                       a reduced rotation cap so the head drifts, not teleports.
+     *
+     * Weights:
+     *   20% – sol devant (watch your step)
+     *   18% – coup d'œil gauche / droite
+     *   18% – avant mi-distance
+     *   12% – joueur proche (awareness)
+     *   13% – balayage horizon légèrement bas
+     *   10% – bloc intéressant
+     *    7% – derrière (curiosité / paranoïa)
+     *    2% – vers le haut
      */
     private void applyWalkingLook() {
         Vec3 fwd = destination != null
             ? destination.subtract(minesis.position()).normalize()
             : minesis.getLookAngle();
 
+        // Jitter souris : imprécision naturelle sur chaque regard
+        double jx = (minesis.getRandom().nextDouble() - 0.5D) * 0.5D;
+        double jy = (minesis.getRandom().nextDouble() - 0.5D) * 0.3D;
+        double jz = (minesis.getRandom().nextDouble() - 0.5D) * 0.5D;
+
         int roll = minesis.getRandom().nextInt(100);
-        if (roll < 30) {
-            // Ground check ahead
-            double d = 1.5D + minesis.getRandom().nextDouble() * 1.5D;
+
+        if (roll < 20) {
+            // Sol devant — regard vers le bas, surveillance du chemin
+            double d = 1.0D + minesis.getRandom().nextDouble() * 2.8D;
             minesis.getLookControl().setLookAt(
-                minesis.getX() + fwd.x * d,
-                minesis.getY() + (minesis.getRandom().nextDouble() - 0.5D) * 0.2D,
-                minesis.getZ() + fwd.z * d,
+                minesis.getX() + fwd.x * d + jx * 0.4,
+                minesis.getY() + 0.1D + minesis.getRandom().nextDouble() * 0.5D,
+                minesis.getZ() + fwd.z * d + jz * 0.4,
                 YAW_SNAP, PIT_SNAP);
-        } else if (roll < 55) {
-            // Side glance
-            float sideYaw = (float)((minesis.getRandom().nextDouble() - 0.5D) * 1.15D);
-            Vec3 side = fwd.yRot(sideYaw);
+
+        } else if (roll < 38) {
+            // Gauche OU droite — légèrement sous l'horizon
+            float side  = minesis.getRandom().nextBoolean() ? 1f : -1f;
+            float angle = side * (float)(0.52 + minesis.getRandom().nextDouble() * 0.7);
+            Vec3  dir   = fwd.yRot(angle);
+            double d    = 3.5D + minesis.getRandom().nextDouble() * 5.5D;
+            double down = d * 0.10D; // ~6° en dessous de l'horizon
             minesis.getLookControl().setLookAt(
-                minesis.getX() + side.x * 5.0D,
-                minesis.getEyeY() + (minesis.getRandom().nextDouble() - 0.5D) * 1.2D,
-                minesis.getZ() + side.z * 5.0D,
+                minesis.getX() + dir.x * d + jx,
+                minesis.getEyeY() - down + jy * 0.7D,
+                minesis.getZ() + dir.z * d + jz,
                 YAW_SNAP, PIT_SNAP);
-        } else if (roll < 75) {
-            // Forward
-            double d = 4.0D + minesis.getRandom().nextDouble() * 5.0D;
+
+        } else if (roll < 56) {
+            // Avant mi-distance — légèrement bas, comme regarder le sol au loin
+            double d    = 4.5D + minesis.getRandom().nextDouble() * 8.0D;
+            double down = d * 0.09D;
             minesis.getLookControl().setLookAt(
-                minesis.getX() + fwd.x * d,
-                minesis.getEyeY() + (minesis.getRandom().nextDouble() - 0.35D) * 1.5D,
-                minesis.getZ() + fwd.z * d,
+                minesis.getX() + fwd.x * d + jx,
+                minesis.getEyeY() - down + jy,
+                minesis.getZ() + fwd.z * d + jz,
                 YAW_SNAP, PIT_SNAP);
-        } else if (roll < 90) {
-            // Horizon
-            float slight = (float)((minesis.getRandom().nextDouble() - 0.5D) * 0.8D);
-            Vec3 hor = fwd.yRot(slight);
-            double d = 14.0D + minesis.getRandom().nextDouble() * 14.0D;
+
+        } else if (roll < 68) {
+            // Joueur proche — regard vers son buste, pas ses yeux
+            net.minecraft.world.entity.player.Player near =
+                minesis.level().getNearestPlayer(minesis, 24.0D);
+            if (near != null) {
+                minesis.getLookControl().setLookAt(
+                    near.getX() + jx * 0.3,
+                    near.getY() + 0.9D + jy * 0.2D,  // buste ~0.9 bloc de haut
+                    near.getZ() + jz * 0.3,
+                    YAW_SNAP, PIT_SNAP);
+            } else {
+                double d    = 15.0D + minesis.getRandom().nextDouble() * 10.0D;
+                double down = d * 0.08D;
+                minesis.getLookControl().setLookAt(
+                    minesis.getX() + fwd.x * d + jx,
+                    minesis.getEyeY() - down + jy,
+                    minesis.getZ() + fwd.z * d + jz,
+                    YAW_SNAP, PIT_SNAP);
+            }
+
+        } else if (roll < 81) {
+            // Horizon balayé — toujours légèrement en dessous, rotation lente (drift)
+            float slight = (float)((minesis.getRandom().nextDouble() - 0.5D) * 1.4D);
+            Vec3  hor    = fwd.yRot(slight);
+            double d     = 14.0D + minesis.getRandom().nextDouble() * 18.0D;
+            double down  = 0.6D + minesis.getRandom().nextDouble() * 1.0D; // 0.6–1.6 sous l'horizon
             minesis.getLookControl().setLookAt(
-                minesis.getX() + hor.x * d,
-                minesis.getEyeY() + (minesis.getRandom().nextDouble() - 0.4D) * 1.0D,
-                minesis.getZ() + hor.z * d,
-                YAW_SNAP, PIT_SNAP);
-        } else if (roll < 98) {
+                minesis.getX() + hor.x * d + jx,
+                minesis.getEyeY() - down + jy * 0.4D,
+                minesis.getZ() + hor.z * d + jz,
+                YAW_SNAP * 0.6F, PIT_SNAP * 0.6F); // drift naturel, pas de snap
+
+        } else if (roll < 91) {
+            // Bloc intéressant — imprecision naturelle
             Vec3 pt = findInterestingLookPoint();
-            minesis.getLookControl().setLookAt(pt.x, pt.y, pt.z, YAW_SNAP, PIT_SNAP);
+            minesis.getLookControl().setLookAt(
+                pt.x + jx * 0.3, pt.y + jy * 0.2, pt.z + jz * 0.3,
+                YAW_SNAP, PIT_SNAP);
+
+        } else if (roll < 98) {
+            // Derrière — curiosité / paranoïa, légèrement bas aussi
+            float back = (float)(Math.PI + (minesis.getRandom().nextDouble() - 0.5D) * 0.7D);
+            Vec3  bd   = fwd.yRot(back);
+            double d   = 4.0D + minesis.getRandom().nextDouble() * 9.0D;
+            double down = d * 0.07D;
+            minesis.getLookControl().setLookAt(
+                minesis.getX() + bd.x * d + jx,
+                minesis.getEyeY() - down + jy * 0.5D,
+                minesis.getZ() + bd.z * d + jz,
+                YAW_SNAP, PIT_SNAP);
+
         } else {
-            // Upward glance
+            // Haut — bruit, ciel, rare
             double a = minesis.getRandom().nextDouble() * Math.PI * 2;
             minesis.getLookControl().setLookAt(
-                minesis.getX() + Math.cos(a) * 3,
-                minesis.getEyeY() + 2.5D,
-                minesis.getZ() + Math.sin(a) * 3,
-                YAW_SNAP, PIT_SNAP);
+                minesis.getX() + Math.cos(a) * 2.5 + jx,
+                minesis.getEyeY() + 1.5D + minesis.getRandom().nextDouble() * 2.5D,
+                minesis.getZ() + Math.sin(a) * 2.5 + jz,
+                YAW_SNAP * 0.8F, PIT_SNAP * 0.8F);
         }
+    }
+
+    /** Timer variable : regards normaux (8–16t) ou fixations (17–30t). */
+    private int nextLookTimer() {
+        int r = minesis.getRandom().nextInt(100);
+        if (r < 65) return 8  + minesis.getRandom().nextInt(9);   // normal : 8–16t
+        return              17 + minesis.getRandom().nextInt(14);  // fixation : 17–30t
     }
 
     // ── EXPLORE ──────────────────────────────────────────────────────────────
 
     private void tickExplore() {
         if (destination == null) destination = findWanderDestination(20.0D, 40.0D);
+        double explSpeed = minesis.isInWater() ? SPEED_WALK : SPEED_EXPL;
+        if (minesis.isInWater()) minesis.setSprinting(false);
         if (repathTicks <= 0 || minesis.getNavigation().isDone()) {
-            minesis.getNavigation().moveTo(destination.x, destination.y, destination.z, SPEED_EXPL);
+            minesis.getNavigation().moveTo(destination.x, destination.y, destination.z, explSpeed);
             repathTicks = 10 + minesis.getRandom().nextInt(14);
         }
         if (minesis.distanceToSqr(destination) < 9.0D) {
             enterState(State.IDLE, 25 + minesis.getRandom().nextInt(40));
             return;
         }
-        if (lookTimer <= 0) { lookTimer = 4 + minesis.getRandom().nextInt(8); applyWalkingLook(); }
+        if (minesis.onGround() && jumpCooldown <= 0) {
+            double terrainBoost = calcTerrainJumpBoost();
+            if (terrainBoost > 0) {
+                minesis.getJumpControl().jump();
+                float yaw = (float) Math.toRadians(minesis.getYRot());
+                Vec3 cur = minesis.getDeltaMovement();
+                minesis.setDeltaMovement(cur.x - Math.sin(yaw) * terrainBoost, cur.y, cur.z + Math.cos(yaw) * terrainBoost);
+                jumpCooldown = terrainBoost > 0.4 ? 18 : 14;
+            } else if (isNearCliffEdge()) {
+                explSpeed = SPEED_WALK * 0.5;
+                minesis.setSprinting(false);
+                if (!minesis.isCrouching()) minesis.startCrouch(8 + minesis.getRandom().nextInt(8));
+            }
+        }
+        if (lookTimer <= 0) { lookTimer = nextLookTimer(); applyWalkingLook(); }
         tryOpenDoorNearSelf();
     }
 
@@ -401,16 +522,29 @@ public class MinesisPlayerLikeMovementGoal extends Goal {
 
         if (!chestOpened) {
             minesis.level().playSound(null, chestTarget, SoundEvents.CHEST_OPEN, SoundSource.BLOCKS, 0.5F, 0.9F + minesis.getRandom().nextFloat() * 0.2F);
+            Block openBlock = minesis.level().getBlockState(chestTarget).getBlock();
+            minesis.level().blockEvent(chestTarget, openBlock, 1, 1);
             chestOpened = true;
             chestUseTimer = 25 + minesis.getRandom().nextInt(40); // 1.25–3.25 s
+
+            // 30% chance to deposit the Echoes Below disc into the first empty slot
+            if (minesis.getRandom().nextFloat() < MinesisConfig.CHEST_DISC_DROP_CHANCE.get().floatValue()
+                    && minesis.level().getBlockEntity(chestTarget) instanceof Container container) {
+                for (int slot = 0; slot < container.getContainerSize(); slot++) {
+                    if (container.getItem(slot).isEmpty()) {
+                        container.setItem(slot, new ItemStack(MinesisItems.MUSIC_DISC_ECHOES_BELOW.get()));
+                        break;
+                    }
+                }
+            }
         }
 
         if (chestUseTimer > 0) {
             chestUseTimer--;
-            // Swing arm occasionally to simulate rummaging
-            if (chestUseTimer % 14 == 0) minesis.swing(InteractionHand.MAIN_HAND);
         } else {
             minesis.level().playSound(null, chestTarget, SoundEvents.CHEST_CLOSE, SoundSource.BLOCKS, 0.5F, 0.9F + minesis.getRandom().nextFloat() * 0.2F);
+            Block closeBlock = minesis.level().getBlockState(chestTarget).getBlock();
+            minesis.level().blockEvent(chestTarget, closeBlock, 1, 0);
             chestOpened = false;
             chestTarget = null;
             chestCooldown = 400 + minesis.getRandom().nextInt(400);
@@ -622,6 +756,13 @@ public class MinesisPlayerLikeMovementGoal extends Goal {
                 repathTicks = 8 + minesis.getRandom().nextInt(8);
             }
         } else {
+            // Forcer la hache dès qu'on est en portée (pas d'attente de transition)
+            if (breakingProgressTicks == 0) {
+                ItemStack axe = minesis.findAxeInHotbar();
+                if (axe.isEmpty()) axe = new ItemStack(Items.IRON_AXE);
+                minesis.setItemInHand(InteractionHand.MAIN_HAND, axe);
+                clearItemTransition();
+            }
             minesis.getNavigation().stop();
             minesis.setShiftKeyDown(true);
             minesis.getLookControl().setLookAt(breakingPos.getX() + 0.5, breakingPos.getY() + 0.5, breakingPos.getZ() + 0.5, YAW_SNAP, PIT_SNAP);
@@ -631,8 +772,13 @@ public class MinesisPlayerLikeMovementGoal extends Goal {
             if (breakingProgressTicks % 5 == 0) minesis.swing(InteractionHand.MAIN_HAND);
             if (breakingProgressTicks >= breakingNeededTicks) {
                 BlockPos broken = breakingPos;
-                minesis.level().destroyBlock(broken, true);
-                minesis.collectNearbyItems(broken);
+                net.minecraft.world.level.block.state.BlockState brokenState = minesis.level().getBlockState(broken);
+                minesis.level().destroyBlock(broken, false);
+                if (minesis.level() instanceof net.minecraft.server.level.ServerLevel sl) {
+                    net.minecraft.world.level.block.Block.dropResources(brokenState, sl, broken,
+                        brokenState.hasBlockEntity() ? sl.getBlockEntity(broken) : null,
+                        minesis, minesis.getMainHandItem());
+                }
                 minesis.level().destroyBlockProgress(minesis.getId(), broken, -1);
                 clearBreaking();
 
@@ -687,6 +833,13 @@ public class MinesisPlayerLikeMovementGoal extends Goal {
                 repathTicks = 8 + minesis.getRandom().nextInt(8);
             }
         } else {
+            // Forcer la pioche dès qu'on est en portée (pas d'attente de transition)
+            if (breakingProgressTicks == 0) {
+                ItemStack pick = minesis.findPickaxeInHotbar();
+                if (pick.isEmpty()) pick = new ItemStack(Items.IRON_PICKAXE);
+                minesis.setItemInHand(InteractionHand.MAIN_HAND, pick);
+                clearItemTransition();
+            }
             minesis.getNavigation().stop();
             minesis.setShiftKeyDown(true);
             minesis.getLookControl().setLookAt(breakingPos.getX() + 0.5, breakingPos.getY() + 0.5, breakingPos.getZ() + 0.5, YAW_SNAP, PIT_SNAP);
@@ -696,8 +849,13 @@ public class MinesisPlayerLikeMovementGoal extends Goal {
             if (breakingProgressTicks % 5 == 0) minesis.swing(InteractionHand.MAIN_HAND);
             if (breakingProgressTicks >= breakingNeededTicks) {
                 BlockPos broken = breakingPos;
-                minesis.level().destroyBlock(broken, true);
-                minesis.collectNearbyItems(broken);
+                net.minecraft.world.level.block.state.BlockState brokenState = minesis.level().getBlockState(broken);
+                minesis.level().destroyBlock(broken, false);
+                if (minesis.level() instanceof net.minecraft.server.level.ServerLevel sl) {
+                    net.minecraft.world.level.block.Block.dropResources(brokenState, sl, broken,
+                        brokenState.hasBlockEntity() ? sl.getBlockEntity(broken) : null,
+                        minesis, minesis.getMainHandItem());
+                }
                 minesis.level().destroyBlockProgress(minesis.getId(), broken, -1);
                 clearBreaking();
 
@@ -723,22 +881,25 @@ public class MinesisPlayerLikeMovementGoal extends Goal {
     // ══════════════════════════════════════════════════════════════════════════
 
     private void chooseNextState() {
-        BlockPos ore   = findNearestOre(12);
+        boolean inCave = minesis.level().getBrightness(
+            net.minecraft.world.level.LightLayer.SKY, minesis.blockPosition()) < 3;
+        BlockPos ore   = findNearestOre(inCave ? 14 : 10);
         BlockPos log   = findNearestLog(12);
         BlockPos chest = chestCooldown <= 0 ? findNearestContainer(20) : null;
         BlockPos table = findNearestCraftingTable(16);
         int roll = minesis.getRandom().nextInt(100);
 
-        // Tâches en priorité si un bloc est visible
-        if      (roll < 40 && ore != null)   { enterState(State.MINE,  300 + minesis.getRandom().nextInt(200)); }
-        else if (roll < 65 && log != null)   { enterState(State.CHOP,  250 + minesis.getRandom().nextInt(150)); }
-        else if (roll < 67 && chest != null) { chestTarget = chest; enterState(State.CHEST_INTERACT, 300); }
-        else if (roll < 69 && table != null) { craftTarget = table; craftUseTimer = 100 + minesis.getRandom().nextInt(120); enterState(State.USE_CRAFTING, 300); }
-        else if (roll < 71)                  { enterState(State.PLACE_STATION, 600); }
-        else if (roll < 85)                  { enterState(State.WANDER,  60 + minesis.getRandom().nextInt(100)); }
-        else if (roll < 91) { destination = findWanderDestination(20, 40); enterState(State.EXPLORE, 150 + minesis.getRandom().nextInt(100)); }
-        else if (roll < 96)                  { enterState(State.IDLE,   25 + minesis.getRandom().nextInt(50)); }
-        else                                 { enterState(State.PAUSE,  40 + minesis.getRandom().nextInt(80)); }
+        // En grotte : le minage est prioritaire (60%), en surface : pondéré normalement (30%)
+        int mineThreshold = inCave ? 60 : 30;
+        if      (roll < mineThreshold && ore != null) { enterState(State.MINE,  300 + minesis.getRandom().nextInt(200)); }
+        else if (roll < 63 && log != null)   { enterState(State.CHOP,  250 + minesis.getRandom().nextInt(150)); }
+        else if (roll < 65 && chest != null) { chestTarget = chest; enterState(State.CHEST_INTERACT, 300); }
+        else if (roll < 66 && table != null) { craftTarget = table; craftUseTimer = 80 + minesis.getRandom().nextInt(80); enterState(State.USE_CRAFTING, 200); }
+        // PLACE_STATION retiré du pool aléatoire — trop fréquent et peu naturel
+        else if (roll < 82)                  { enterState(State.WANDER,  80 + minesis.getRandom().nextInt(120)); }
+        else if (roll < 93) { destination = findWanderDestination(20, 45); enterState(State.EXPLORE, 180 + minesis.getRandom().nextInt(140)); }
+        else if (roll < 97)                  { enterState(State.IDLE,   20 + minesis.getRandom().nextInt(35)); }
+        else                                 { enterState(State.PAUSE,  30 + minesis.getRandom().nextInt(50)); }
     }
 
     private void enterState(State next, int duration) {
@@ -803,15 +964,34 @@ public class MinesisPlayerLikeMovementGoal extends Goal {
     // ══════════════════════════════════════════════════════════════════════════
 
     private Vec3 findWanderDestination(double minR, double maxR) {
-        for (int i = 0; i < 12; i++) {
+        // First pass: prefer unvisited dry-ground destinations
+        for (int i = 0; i < 16; i++) {
             double a = minesis.getRandom().nextDouble() * Math.PI * 2;
             double r = minR + minesis.getRandom().nextDouble() * (maxR - minR);
-            Vec3 p = snapToGround(minesis.getX() + Math.cos(a) * r, minesis.getZ() + Math.sin(a) * r, minesis.getY());
+            double tx = minesis.getX() + Math.cos(a) * r;
+            double tz = minesis.getZ() + Math.sin(a) * r;
+            if (!isGroundDry(tx, tz)) continue;
+            Vec3 p = snapToGround(tx, tz, minesis.getY());
             if (!isRecentlyVisited(p)) return p;
         }
-        double a = minesis.getRandom().nextDouble() * Math.PI * 2;
-        double r = minR + minesis.getRandom().nextDouble() * (maxR - minR);
-        return snapToGround(minesis.getX() + Math.cos(a) * r, minesis.getZ() + Math.sin(a) * r, minesis.getY());
+        // Second pass: dry ground, recency ignored
+        for (int i = 0; i < 16; i++) {
+            double a = minesis.getRandom().nextDouble() * Math.PI * 2;
+            double r = minR + minesis.getRandom().nextDouble() * (maxR - minR);
+            double tx = minesis.getX() + Math.cos(a) * r;
+            double tz = minesis.getZ() + Math.sin(a) * r;
+            if (isGroundDry(tx, tz)) return snapToGround(tx, tz, minesis.getY());
+        }
+        return minesis.position();
+    }
+
+    /** Returns true if the highest solid block at (x, z) is not fluid. */
+    private boolean isGroundDry(double x, double z) {
+        int bx = (int) Math.floor(x);
+        int bz = (int) Math.floor(z);
+        int y = minesis.level().getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, bx, bz);
+        BlockState gs = minesis.level().getBlockState(new BlockPos(bx, y - 1, bz));
+        return !gs.isAir() && gs.getFluidState().isEmpty();
     }
 
     private Vec3 snapToGround(double x, double z, double refY) {
@@ -867,14 +1047,17 @@ public class MinesisPlayerLikeMovementGoal extends Goal {
         else stuckTicks = 0;
         lastPos = now;
         if (stuckTicks < 8) return;
-        if (!tryOpenDoorNearSelf() && !breakSoftObstacleInFront()) {
-            if (stuckTicks >= 16) {
-                destination = findWanderDestination(4, 12);
-                repathTicks = 0; stuckTicks = 0;
-                if (state == State.CHOP || state == State.MINE)
-                    enterState(State.WANDER, 60 + minesis.getRandom().nextInt(60));
-            }
-        } else stuckTicks = 0;
+        boolean canBreak = state == State.CHOP || state == State.MINE;
+        if (tryOpenDoorNearSelf() || (canBreak && breakSoftObstacleInFront())) {
+            stuckTicks = 0;
+        } else if (stuckTicks >= 16 && canBreak && breakAnyObstacleInFront()) {
+            stuckTicks = 0;
+        } else if (stuckTicks >= 24) {
+            destination = findWanderDestination(4, 12);
+            repathTicks = 0; stuckTicks = 0;
+            if (state == State.CHOP || state == State.MINE)
+                enterState(State.WANDER, 60 + minesis.getRandom().nextInt(60));
+        }
     }
 
     private boolean breakSoftObstacleInFront() {
@@ -886,7 +1069,126 @@ public class MinesisPlayerLikeMovementGoal extends Goal {
         for (int i = 1; i <= 2; i++) {
             BlockPos p = base.offset(sx * i, 0, sz * i);
             BlockState s = minesis.level().getBlockState(p);
-            if (!s.isAir() && isSoftBreakable(s)) { minesis.level().destroyBlock(p, true); return true; }
+            if (!s.isAir() && isSoftBreakable(s) && !isOreBlock(s) && !isLogBlock(s) && !isContainerBlock(s)) {
+                minesis.level().destroyBlock(p, false);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Breaks any non-indestructible block (hardness ≥ 0 and < 50) in front of the entity,
+     * checking both foot and head level. Used when soft-block breaking fails and the entity
+     * is still stuck. Swings arm + shows look direction for visual feedback.
+     */
+    private boolean breakAnyObstacleInFront() {
+        Vec3 look = minesis.getLookAngle();
+        int sx = (int) Math.signum(look.x), sz = (int) Math.signum(look.z);
+        if (sx == 0 && sz == 0) sx = 1;
+        if (sx != 0 && sz != 0) { if (minesis.getRandom().nextBoolean()) sz = 0; else sx = 0; }
+        BlockPos base = minesis.blockPosition();
+        for (int dy = 0; dy <= 1; dy++) {
+            for (int i = 1; i <= 2; i++) {
+                BlockPos p = base.offset(sx * i, dy, sz * i);
+                BlockState s = minesis.level().getBlockState(p);
+                float speed = s.getDestroySpeed(minesis.level(), p);
+                if (!s.isAir() && s.getFluidState().isEmpty() && speed >= 0 && speed < 50
+                        && !isOreBlock(s) && !isLogBlock(s) && !isContainerBlock(s)) {
+                    minesis.getLookControl().setLookAt(p.getX() + 0.5, p.getY() + 0.5, p.getZ() + 0.5, 50, 50);
+                    minesis.swing(InteractionHand.MAIN_HAND);
+                    minesis.level().destroyBlock(p, false);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Returns the horizontal boost needed for terrain ahead, or 0 if no jump is needed:
+     *   0.3 → step-up (1-block ledge) or narrow gap (~1 block)
+     *   0.5 → 2-block gap (needs sprint)
+     *   0.7 → 3-block gap (needs full sprint, max reliable range)
+     *
+     * Only fires when the entity is close to the edge (gapStart ≤ 1.5 blocks ahead)
+     * so the jump is always timed correctly.
+     */
+    private double calcTerrainJumpBoost() {
+        if (destination == null) return 0;
+        Vec3 toGoal = destination.subtract(minesis.position());
+        double hDist = Math.sqrt(toGoal.x * toGoal.x + toGoal.z * toGoal.z);
+        if (hDist < 1.5) return 0;
+        double nx = toGoal.x / hDist, nz = toGoal.z / hDist;
+        BlockPos base = minesis.blockPosition();
+
+        // Step-up: solid block at foot level 1–2 blocks ahead, 2-block clearance above
+        for (double d = 0.9; d <= 1.8; d += 0.4) {
+            BlockPos ahead = new BlockPos(
+                (int) Math.floor(minesis.getX() + nx * d),
+                base.getY(),
+                (int) Math.floor(minesis.getZ() + nz * d));
+            BlockState s = minesis.level().getBlockState(ahead);
+            if (!s.isAir() && s.getFluidState().isEmpty()) {
+                boolean clear = minesis.level().getBlockState(ahead.above()).isAir()
+                             && minesis.level().getBlockState(ahead.above().above()).isAir();
+                if (clear) return 0.3;
+            }
+        }
+
+        // Gap scan: find where ground disappears then reappears ahead.
+        // Only jump if gap edge is within 1.5 blocks (correct timing).
+        double gapStartD = -1, gapEndD = -1;
+        for (double d = 0.6; d <= 5.2; d += 0.3) {
+            BlockPos ground = new BlockPos(
+                (int) Math.floor(minesis.getX() + nx * d),
+                base.getY() - 1,
+                (int) Math.floor(minesis.getZ() + nz * d));
+            boolean hasGround = !minesis.level().getBlockState(ground).isAir();
+            if (gapStartD < 0 && !hasGround)      { gapStartD = d; }
+            else if (gapStartD >= 0 && hasGround)  { gapEndD = d; break; }
+        }
+        if (gapStartD < 0 || gapEndD < 0 || gapStartD > 1.5) return 0;
+
+        // Verify landing has 2-block headroom
+        BlockPos landing = new BlockPos(
+            (int) Math.floor(minesis.getX() + nx * (gapEndD + 0.2)),
+            base.getY(),
+            (int) Math.floor(minesis.getZ() + nz * (gapEndD + 0.2)));
+        if (!minesis.level().getBlockState(landing).isAir()) return 0;
+        if (!minesis.level().getBlockState(landing.above()).isAir()) return 0;
+
+        double gapWidth = gapEndD - gapStartD;
+        if (gapWidth < 1.5) return 0.3;
+        if (gapWidth < 2.5) return 0.5;
+        if (gapWidth < 3.8) return 0.7;
+        return 0; // trop large, ne pas tenter
+    }
+
+    /**
+     * Returns true when there is a drop of ≥ 3 blocks directly ahead (cliff),
+     * so the entity should slow down and sneak rather than walk off.
+     */
+    private boolean isNearCliffEdge() {
+        if (destination == null) return false;
+        Vec3 toGoal = destination.subtract(minesis.position());
+        double hDist = Math.sqrt(toGoal.x * toGoal.x + toGoal.z * toGoal.z);
+        if (hDist < 1.5) return false;
+        double nx = toGoal.x / hDist, nz = toGoal.z / hDist;
+        BlockPos base = minesis.blockPosition();
+        for (double d = 0.7; d <= 1.3; d += 0.3) {
+            BlockPos groundCheck = new BlockPos(
+                (int) Math.floor(minesis.getX() + nx * d),
+                base.getY() - 1,
+                (int) Math.floor(minesis.getZ() + nz * d));
+            if (!minesis.level().getBlockState(groundCheck).isAir()) continue;
+            // No ground — count fall depth
+            int drop = 0;
+            for (int i = 0; i < 5; i++) {
+                if (minesis.level().getBlockState(groundCheck.below(i)).isAir()) drop++;
+                else break;
+            }
+            if (drop >= 3) return true;
         }
         return false;
     }
@@ -900,6 +1202,11 @@ public class MinesisPlayerLikeMovementGoal extends Goal {
             || b == Blocks.BIRCH_LOG || b == Blocks.OAK_LEAVES || b == Blocks.SPRUCE_LEAVES
             || b == Blocks.BIRCH_LEAVES || b == Blocks.COBWEB || b == Blocks.VINE
             || b == Blocks.TALL_GRASS || b == Blocks.SNOW;
+    }
+
+    private boolean isContainerBlock(BlockState s) {
+        Block b = s.getBlock();
+        return b == Blocks.CHEST || b == Blocks.TRAPPED_CHEST || b == Blocks.BARREL;
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -1035,8 +1342,9 @@ public class MinesisPlayerLikeMovementGoal extends Goal {
             base.north().east(), base.north().west(), base.south().east(), base.south().west()
         };
         for (BlockPos pos : candidates) {
+            BlockState below = minesis.level().getBlockState(pos.below());
             if (minesis.level().getBlockState(pos).isAir()
-                    && !minesis.level().getBlockState(pos.below()).isAir()
+                    && below.canOcclude() && below.getFluidState().isEmpty()
                     && minesis.level().getBlockState(pos.above()).isAir()) {
                 return pos;
             }
@@ -1123,6 +1431,8 @@ public class MinesisPlayerLikeMovementGoal extends Goal {
             if (candidate.equals(target)) continue;
             if (!minesis.level().getBlockState(candidate).isAir()) continue;
             if (!hasAdjacentSolid(candidate)) continue;
+            BlockState belowCand = minesis.level().getBlockState(candidate.below());
+            if (!belowCand.canOcclude() || !belowCand.getFluidState().isEmpty()) continue;
             minesis.level().setBlock(candidate, Blocks.COBBLESTONE.defaultBlockState(), 3);
             minesis.getLookControl().setLookAt(candidate.getX() + 0.5, candidate.getY() + 0.5,
                     candidate.getZ() + 0.5, YAW_SNAP, PIT_SNAP);

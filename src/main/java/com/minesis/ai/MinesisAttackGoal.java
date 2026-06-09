@@ -302,7 +302,9 @@ public class MinesisAttackGoal extends Goal {
         }
 
         BlockPos place = base.offset(sx, 0, sz);
-        if (this.minesis.level().getBlockState(place).isAir() && !this.minesis.level().getBlockState(place.below()).isAir()) {
+        BlockState belowPlace = this.minesis.level().getBlockState(place.below());
+        if (this.minesis.level().getBlockState(place).isAir()
+                && belowPlace.canOcclude() && belowPlace.getFluidState().isEmpty()) {
             this.minesis.level().setBlock(place, Blocks.COBBLESTONE.defaultBlockState(), 3);
             this.minesis.swing(net.minecraft.world.InteractionHand.MAIN_HAND);
             if (!this.minesis.level().isClientSide) {

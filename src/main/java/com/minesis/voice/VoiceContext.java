@@ -6,6 +6,12 @@ public enum VoiceContext {
     RUNNING,
     SWIMMING,
     MINING,
+    WOODCUTTING,
     CRAFTING,
-    COMBAT
+    SMELTING,
+    BUILDING,
+    FARMING,
+    COMBAT,
+    HURT,
+    FLEEING
 }
